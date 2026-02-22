@@ -50,7 +50,12 @@ def build_forecast_inputs(
 
     dynamic_numerical_covariates: dict[str, list[list[float]]] = {}
     for name in BENCHMARK_TICKERS:
-        dynamic_numerical_covariates[name] = [frame[name].to_numpy(dtype=float).tolist()]
+        benchmark_series = frame[name].to_numpy(dtype=float)
+        benchmark_context = benchmark_series[: window.context_len]
+        last_known = benchmark_context[-1]
+        future_proxy = np.full(window.horizon_len, last_known, dtype=float)
+        strict_realtime_covariate = np.concatenate([benchmark_context, future_proxy])
+        dynamic_numerical_covariates[name] = [strict_realtime_covariate.tolist()]
 
     return input_target, actual_future, dynamic_numerical_covariates
 
