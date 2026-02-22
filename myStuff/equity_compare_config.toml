@@ -1,0 +1,5 @@
+# Primary equity ticker to compare against market indices.
+ticker = "VTI"
+
+# Number of calendar days before today to fetch daily data for.
+lookback_days = 365

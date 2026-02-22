@@ -14,8 +14,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26.4",
-    "huggingface_hub[cli]>=0.23.0",
+    "huggingface_hub>=0.23.0",
     "safetensors>=0.5.3",
+    "yfinance>=1.2.0",
+    "matplotlib>=3.10.8",
+    "pandas>=2.3.3",
 ]
 
 [project.optional-dependencies]
@@ -28,10 +31,12 @@ flax = [
     "einshape",
     "orbax-checkpoint",
     "jaxtyping",
-    "jax[cuda]"
+    "jax[cuda]; platform_system == 'Linux'",
+    "jax; platform_system != 'Linux'",
 ]
 xreg = [
-    "jax[cuda]",
+    "jax[cuda]; platform_system == 'Linux'",
+    "jax; platform_system != 'Linux'",
     "scikit-learn",
 ]
 
@@ -39,7 +44,17 @@ xreg = [
 line-length = 88
 indent-width = 2
 
+[tool.uv.sources]
+timesfm = { workspace = true }
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.8",
+    "timesfm[xreg]",
+    "torch>=2.10.0",
+]

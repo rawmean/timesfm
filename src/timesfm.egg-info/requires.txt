@@ -1,0 +1,31 @@
+numpy>=1.26.4
+huggingface_hub>=0.23.0
+safetensors>=0.5.3
+yfinance>=1.2.0
+matplotlib>=3.10.8
+pandas>=2.3.3
+
+[flax]
+flax
+optax
+einshape
+orbax-checkpoint
+jaxtyping
+
+[flax:platform_system != "Linux"]
+jax
+
+[flax:platform_system == "Linux"]
+jax[cuda]
+
+[torch]
+torch>=2.0.0
+
+[xreg]
+scikit-learn
+
+[xreg:platform_system != "Linux"]
+jax
+
+[xreg:platform_system == "Linux"]
+jax[cuda]
