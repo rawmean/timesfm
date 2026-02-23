@@ -37,9 +37,12 @@ class FineTuneConfig:
     context_length: int = 64
     horizon: int = 7
     test_size: int = 120
+    val_fraction: float = 0.15
     batch_size: int = 8
     num_epochs: int = 15
     learning_rate: float = 1e-4
+    finetune_mode: str = "peft"
+    peft_last_n_layers: int = 2
     device: str = "auto"
     show_progress: bool = True
     tensorboard: bool = True
@@ -82,6 +85,25 @@ def parse_args() -> FineTuneConfig:
     parser.add_argument("--batch-size", type=int, default=FineTuneConfig.batch_size)
     parser.add_argument("--learning-rate", type=float, default=FineTuneConfig.learning_rate)
     parser.add_argument(
+        "--finetune-mode",
+        type=str,
+        choices=["peft", "full"],
+        default=FineTuneConfig.finetune_mode,
+        help="Use 'peft' (parameter-efficient) or 'full' fine-tuning.",
+    )
+    parser.add_argument(
+        "--peft-last-n-layers",
+        type=int,
+        default=FineTuneConfig.peft_last_n_layers,
+        help="For PEFT mode: additionally unfreeze last N transformer layers.",
+    )
+    parser.add_argument(
+        "--val-fraction",
+        type=float,
+        default=FineTuneConfig.val_fraction,
+        help="Fraction of pre-test data reserved for validation (temporal split).",
+    )
+    parser.add_argument(
         "--test-size",
         type=int,
         default=FineTuneConfig.test_size,
@@ -118,7 +140,10 @@ def parse_args() -> FineTuneConfig:
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        finetune_mode=args.finetune_mode,
+        peft_last_n_layers=args.peft_last_n_layers,
         test_size=args.test_size,
+        val_fraction=args.val_fraction,
         device=args.device,
         show_progress=not args.no_progress,
         tensorboard=not args.no_tensorboard,
@@ -173,7 +198,8 @@ def maybe_create_writer(config: FineTuneConfig):
         (
             f"ticker={config.ticker}, years={config.years_of_history}, "
             f"context={config.context_length}, horizon={config.horizon}, "
-            f"test_size={config.test_size}, "
+            f"test_size={config.test_size}, val_fraction={config.val_fraction}, "
+            f"finetune_mode={config.finetune_mode}, peft_last_n_layers={config.peft_last_n_layers}, "
             f"epochs={config.num_epochs}, batch_size={config.batch_size}, "
             f"learning_rate={config.learning_rate}, device={config.device}"
         ),
@@ -199,6 +225,37 @@ def gradient_diagnostics(module: torch.nn.Module) -> tuple[int, int, float, floa
         total_grad_norm += float(torch.norm(grad).item())
         max_abs_grad = max(max_abs_grad, float(torch.max(torch.abs(grad)).item()))
     return total_params, params_with_grad, total_grad_norm, max_abs_grad
+
+
+def configure_trainable_parameters(
+    pytorch_model: torch.nn.Module, config: FineTuneConfig
+) -> tuple[int, int]:
+    total_params = sum(p.numel() for p in pytorch_model.parameters())
+    for param in pytorch_model.parameters():
+        param.requires_grad = False
+
+    if config.finetune_mode == "full":
+        for param in pytorch_model.parameters():
+            param.requires_grad = True
+    else:
+        # PEFT mode: train small output/tokenizer blocks and optionally last N transformer layers.
+        if hasattr(pytorch_model, "tokenizer"):
+            for p in pytorch_model.tokenizer.parameters():
+                p.requires_grad = True
+        if hasattr(pytorch_model, "output_projection_point"):
+            for p in pytorch_model.output_projection_point.parameters():
+                p.requires_grad = True
+        if hasattr(pytorch_model, "output_projection_quantiles"):
+            for p in pytorch_model.output_projection_quantiles.parameters():
+                p.requires_grad = True
+        if hasattr(pytorch_model, "stacked_xf") and config.peft_last_n_layers > 0:
+            n = min(config.peft_last_n_layers, len(pytorch_model.stacked_xf))
+            for layer in list(pytorch_model.stacked_xf)[-n:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+
+    trainable_params = sum(p.numel() for p in pytorch_model.parameters() if p.requires_grad)
+    return trainable_params, total_params
 
 
 def differentiable_point_forecast(
@@ -336,13 +393,13 @@ def load_model(config: FineTuneConfig):
     return model, device
 
 
-def prepare_loader(data: np.ndarray, config: FineTuneConfig) -> DataLoader:
+def prepare_loader(data: np.ndarray, config: FineTuneConfig, shuffle: bool) -> DataLoader:
     dataset = TimeSeriesDataset(
         data=data,
         context_length=config.context_length,
         horizon=config.horizon,
     )
-    return DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
+    return DataLoader(dataset, batch_size=config.batch_size, shuffle=shuffle, num_workers=0)
 
 
 def _extract_torch_model(model):
@@ -353,37 +410,76 @@ def _extract_torch_model(model):
     return model
 
 
-def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device: torch.device):
+def evaluate_loader_loss(
+    pytorch_model: torch.nn.Module,
+    loader: DataLoader,
+    criterion: torch.nn.Module,
+    device: torch.device,
+    horizon: int,
+) -> float:
+    losses: list[float] = []
+    pytorch_model.eval()
+    with torch.no_grad():
+        for context, target in loader:
+            context = context.to(device=device, dtype=torch.float32)
+            target = target.to(device=device, dtype=torch.float32)
+            pred_tensor = differentiable_point_forecast(
+                pytorch_model, context=context, horizon=horizon
+            )
+            loss = criterion(pred_tensor, target)
+            losses.append(float(loss.item()))
+    return float(np.mean(losses)) if losses else float("nan")
+
+
+def finetune_model(
+    model,
+    train_data: np.ndarray,
+    val_data: np.ndarray,
+    config: FineTuneConfig,
+    device: torch.device,
+):
     print("=" * 70)
     print("STARTING FINE-TUNING")
     print("=" * 70)
     print(f"Ticker: {config.ticker}")
     print(f"Training points: {len(train_data)}")
+    print(f"Validation points: {len(val_data)}")
     print(f"Context length: {config.context_length}")
     print(f"Horizon: {config.horizon}")
     print(f"Batch size: {config.batch_size}")
     print(f"Learning rate: {config.learning_rate}")
+    print(f"Finetune mode: {config.finetune_mode}")
+    if config.finetune_mode == "peft":
+        print(f"PEFT last transformer layers: {config.peft_last_n_layers}")
     print(f"Epochs: {config.num_epochs}\n")
     print(f"Device: {device}\n")
 
-    train_loader = prepare_loader(train_data, config)
+    train_loader = prepare_loader(train_data, config, shuffle=True)
     if len(train_loader) == 0:
         raise ValueError(
             f"Not enough data for training. Need at least {config.context_length + config.horizon} points."
         )
+    val_loader = prepare_loader(val_data, config, shuffle=False)
+    if len(val_loader) == 0:
+        raise ValueError(
+            f"Not enough data for validation. Need at least {config.context_length + config.horizon} points."
+        )
 
     pytorch_model = _extract_torch_model(model)
     pytorch_model.train()
+    trainable_numel, total_numel = configure_trainable_parameters(pytorch_model, config)
     trainable_params = [p for p in pytorch_model.parameters() if p.requires_grad]
     if not trainable_params:
-        print("No trainable parameters were marked; unfreezing all parameters.")
-        for param in pytorch_model.parameters():
-            param.requires_grad = True
-        trainable_params = list(pytorch_model.parameters())
+        raise ValueError("No trainable parameters selected by fine-tuning configuration.")
+    print(
+        f"Trainable params: {trainable_numel:,} / {total_numel:,} "
+        f"({100.0 * trainable_numel / max(1, total_numel):.2f}%)"
+    )
 
     optimizer = optim.Adam(trainable_params, lr=config.learning_rate)
     criterion = nn.MSELoss()
     training_losses: list[float] = []
+    validation_losses: list[float] = []
     writer = maybe_create_writer(config)
     global_step = 0
 
@@ -444,15 +540,23 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
                 return model, []
 
         avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+        val_loss = evaluate_loader_loss(
+            pytorch_model, val_loader, criterion, device, config.horizon
+        )
         avg_grad_norm = float(np.mean(epoch_grad_norms)) if epoch_grad_norms else 0.0
         max_grad_abs = float(np.max(epoch_grad_max)) if epoch_grad_max else 0.0
         training_losses.append(avg_loss)
+        validation_losses.append(val_loss)
         if writer is not None:
             writer.add_scalar("train/epoch_loss", avg_loss, epoch + 1)
+            writer.add_scalar("val/epoch_loss", val_loss, epoch + 1)
             writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], epoch + 1)
             writer.add_scalar("debug/epoch_avg_grad_norm_sum", avg_grad_norm, epoch + 1)
             writer.add_scalar("debug/epoch_max_abs_grad", max_grad_abs, epoch + 1)
-        print(f"Epoch {epoch + 1}/{config.num_epochs}, average loss: {avg_loss:.6f}")
+        print(
+            f"Epoch {epoch + 1}/{config.num_epochs}, "
+            f"train loss: {avg_loss:.6f}, val loss: {val_loss:.6f}"
+        )
         print(
             f"Gradient diagnostic: params_with_grad={epoch_grad_params}/{epoch_total_params}, "
             f"avg_grad_norm_sum={avg_grad_norm:.6e}, max_abs_grad={max_grad_abs:.6e}"
@@ -464,11 +568,17 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
         print(f"TensorBoard logs written to: {config.log_dir}")
 
     pytorch_model.eval()
-    _save_checkpoint(model, optimizer, training_losses, config)
-    return model, training_losses
+    _save_checkpoint(model, optimizer, training_losses, validation_losses, config)
+    return model, training_losses, validation_losses
 
 
-def _save_checkpoint(model, optimizer, training_losses: list[float], config: FineTuneConfig) -> None:
+def _save_checkpoint(
+    model,
+    optimizer,
+    training_losses: list[float],
+    validation_losses: list[float],
+    config: FineTuneConfig,
+) -> None:
     config.save_path.parent.mkdir(parents=True, exist_ok=True)
     if hasattr(model, "model"):
         model_state = model.model.state_dict()
@@ -482,12 +592,14 @@ def _save_checkpoint(model, optimizer, training_losses: list[float], config: Fin
             "model_state_dict": model_state,
             "optimizer_state_dict": optimizer.state_dict(),
             "training_losses": training_losses,
+            "validation_losses": validation_losses,
             "config": {
                 "ticker": config.ticker,
                 "context_length": config.context_length,
                 "horizon": config.horizon,
                 "num_epochs": config.num_epochs,
                 "learning_rate": config.learning_rate,
+                "val_fraction": config.val_fraction,
             },
         },
         config.save_path,
@@ -643,6 +755,8 @@ def plot_covariate_results(
 def main() -> None:
     config = parse_args()
     series = fetch_ticker_history(config)
+    if not (0.0 < config.val_fraction < 1.0):
+        raise ValueError(f"val_fraction must be in (0, 1), got {config.val_fraction}.")
     min_test_size = config.context_length + config.horizon
     if config.test_size < min_test_size:
         raise ValueError(
@@ -654,15 +768,26 @@ def main() -> None:
             f"Not enough data for split. Need at least {config.context_length + config.test_size + 1}, got {len(series)}."
         )
 
-    # Hold out an explicit test set. Final forecast is evaluated on unseen tail points.
-    train_series = series.iloc[: -config.test_size]
+    # Hold out an explicit test set, then carve out validation from pre-test data.
+    trainval_series = series.iloc[: -config.test_size]
     test_series = series.iloc[-config.test_size :]
+    val_size = int(np.ceil(len(trainval_series) * config.val_fraction))
+    min_window = config.context_length + config.horizon
+    if val_size < min_window:
+        val_size = min_window
+    if len(trainval_series) - val_size < min_window:
+        raise ValueError(
+            "Not enough pre-test data for both train and validation windows. "
+            f"Need at least {2 * min_window} pre-test points, got {len(trainval_series)}."
+        )
+    train_series = trainval_series.iloc[: -val_size]
+    val_series = trainval_series.iloc[-val_size:]
     holdout_series = series.iloc[-config.horizon :]
     eval_context = series.iloc[-(config.context_length + config.horizon) : -config.horizon]
-    split_date = pd.Timestamp(train_series.index[-1])
+    split_date = pd.Timestamp(trainval_series.index[-1])
     print(
-        f"Train/test split at {split_date.strftime('%Y-%m-%d')} | "
-        f"train={len(train_series)} points, test={len(test_series)} points"
+        f"Train/val/test split at {split_date.strftime('%Y-%m-%d')} | "
+        f"train={len(train_series)} points, val={len(val_series)} points, test={len(test_series)} points"
     )
     print(
         f"Final evaluation window (tail): "
@@ -671,8 +796,12 @@ def main() -> None:
     )
 
     model, device = load_model(config)
-    model, losses = finetune_model(
-        model, train_series.to_numpy(dtype=np.float32), config, device
+    model, losses, val_losses = finetune_model(
+        model,
+        train_series.to_numpy(dtype=np.float32),
+        val_series.to_numpy(dtype=np.float32),
+        config,
+        device,
     )
 
     print(f"\nGenerating forecast from the latest {config.context_length}-day context...")
@@ -697,11 +826,14 @@ def main() -> None:
 
     if losses:
         plt.figure(figsize=(9, 4))
-        plt.plot(range(1, len(losses) + 1), losses, marker="o")
+        plt.plot(range(1, len(losses) + 1), losses, marker="o", label="Train")
+        if val_losses:
+            plt.plot(range(1, len(val_losses) + 1), val_losses, marker="s", label="Validation")
         plt.title("Fine-tuning loss")
         plt.xlabel("Epoch")
         plt.ylabel("MSE")
         plt.grid(alpha=0.3)
+        plt.legend(loc="best")
         plt.tight_layout()
         plt.show()
 
