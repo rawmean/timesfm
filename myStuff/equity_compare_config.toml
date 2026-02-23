@@ -3,4 +3,4 @@ ticker = "VTI"
 
 # Number of calendar days before today to fetch daily data for.
 # Keep this comfortably above 307 required rows for 300 context + 7 horizon.
-lookback_days = 730
+lookback_days = 930

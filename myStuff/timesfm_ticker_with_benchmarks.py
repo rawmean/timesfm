@@ -20,7 +20,7 @@ from equity_benchmark_compare import (
 
 @dataclass(frozen=True)
 class ForecastWindow:
-    context_len: int = 300
+    context_len: int = 600
     horizon_len: int = 7
 
 
@@ -37,19 +37,29 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.bfill().fillna(50.0)
 
 
-def prepare_normalized_data(config_path: Path) -> tuple[str, pd.DataFrame]:
+def prepare_normalized_data(config_path: Path) -> tuple[str, pd.DataFrame, pd.DataFrame]:
     config = load_config(config_path)
     symbols = build_symbol_map(config.ticker)
     close_prices = fetch_daily_close(symbols, config.lookback_days)
     normalized = normalize_from_start(close_prices).dropna()
-    return config.ticker, normalized
+    raw_aligned = close_prices.loc[normalized.index].copy()
+    return config.ticker, normalized, raw_aligned
 
 
 def build_forecast_inputs(
     normalized: pd.DataFrame,
+    raw_prices: pd.DataFrame,
     target_ticker: str,
     window: ForecastWindow,
-) -> tuple[list[float], np.ndarray, dict[str, list[list[float]]]]:
+) -> tuple[
+    list[float],
+    np.ndarray,
+    dict[str, list[list[float]]],
+    dict[str, list[list[int]]],
+    np.ndarray,
+    np.ndarray,
+    float,
+]:
     required = window.context_len + window.horizon_len
     if len(normalized) < required:
         raise ValueError(
@@ -57,12 +67,17 @@ def build_forecast_inputs(
         )
 
     frame = normalized.iloc[-required:].copy()
+    raw_frame = raw_prices.iloc[-required:].copy()
     base_row = frame.iloc[0].replace(0.0, np.nan)
     frame = frame.divide(base_row).ffill().bfill()
 
     target_series = frame[target_ticker].to_numpy(dtype=float)
     input_target = target_series[: window.context_len].tolist()
     actual_future = target_series[window.context_len :]
+    raw_target_series = raw_frame[target_ticker].to_numpy(dtype=float)
+    raw_context = raw_target_series[: window.context_len]
+    raw_actual_future = raw_target_series[window.context_len :]
+    raw_base = float(raw_context[0])
     full_target_rsi = compute_rsi(frame[target_ticker], period=14)
     rsi_frame = full_target_rsi.to_numpy(dtype=float)
 
@@ -94,12 +109,26 @@ def build_forecast_inputs(
     strict_realtime_rsi = np.concatenate([rsi_context, rsi_future_proxy])
     dynamic_numerical_covariates["Target_RSI_14"] = [strict_realtime_rsi.tolist()]
 
-    return input_target, actual_future, dynamic_numerical_covariates
+    day_of_week = frame.index.dayofweek.to_numpy(dtype=int)
+    dynamic_categorical_covariates: dict[str, list[list[int]]] = {
+        "DayOfWeek": [day_of_week.tolist()]
+    }
+
+    return (
+        input_target,
+        actual_future,
+        dynamic_numerical_covariates,
+        dynamic_categorical_covariates,
+        raw_context,
+        raw_actual_future,
+        raw_base,
+    )
 
 
 def forecast_with_timesfm(
     input_target: list[float],
     dynamic_numerical_covariates: dict[str, list[list[float]]],
+    dynamic_categorical_covariates: dict[str, list[list[int]]],
     window: ForecastWindow,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(
@@ -121,6 +150,7 @@ def forecast_with_timesfm(
     point_forecast_with_covars, quantile_forecast_with_covars = model.forecast_with_covariates(
         inputs=[input_target],
         dynamic_numerical_covariates=dynamic_numerical_covariates,
+        dynamic_categorical_covariates=dynamic_categorical_covariates,
         xreg_mode="xreg + timesfm",
         ridge=0.0,
         normalize_xreg_target_per_input=True,
@@ -156,7 +186,7 @@ def forecast_with_timesfm(
 
 def plot_context_and_prediction(
     target_ticker: str,
-    input_target: list[float],
+    context_values: np.ndarray,
     predicted_with_covars: np.ndarray,
     predicted_no_covars: np.ndarray,
     p10_with_covars: np.ndarray,
@@ -165,9 +195,9 @@ def plot_context_and_prediction(
     p90_no_covars: np.ndarray,
     actual_future: np.ndarray,
 ) -> None:
-    context_len = len(input_target)
+    context_len = len(context_values)
     plot_context_len = min(30, context_len)
-    context_tail = np.asarray(input_target[-plot_context_len:], dtype=float)
+    context_tail = np.asarray(context_values[-plot_context_len:], dtype=float)
     x_context = np.arange(plot_context_len)
     x_future_covars = np.arange(
         plot_context_len, plot_context_len + len(predicted_with_covars)
@@ -177,7 +207,7 @@ def plot_context_and_prediction(
     )
 
     plt.figure(figsize=(12, 5))
-    plt.plot(x_context, context_tail, marker="o", linewidth=2, label="Context (last 30, normalized)")
+    plt.plot(x_context, context_tail, marker="o", linewidth=2, label="Context (last 30)")
     plt.plot(
         x_future_covars,
         predicted_with_covars,
@@ -222,12 +252,11 @@ def plot_context_and_prediction(
         )
 
     plt.axvline(plot_context_len - 0.5, color="gray", linestyle=":", linewidth=1)
-    plt.axhline(1.0, color="black", linestyle=":", linewidth=1)
     plt.title(
         f"{target_ticker}: Last {plot_context_len} Context Points (of {context_len}) + {len(predicted_with_covars)}-day Forecast"
     )
     plt.xlabel("Time step")
-    plt.ylabel("Normalized value (start = 1.0)")
+    plt.ylabel("Price")
     plt.grid(alpha=0.3)
     plt.legend(loc="best")
     plt.tight_layout()
@@ -236,9 +265,18 @@ def plot_context_and_prediction(
 
 def run(config_path: Path) -> np.ndarray:
     window = ForecastWindow()
-    target_ticker, normalized = prepare_normalized_data(config_path)
-    input_target, actual_future, dynamic_covariates = build_forecast_inputs(
+    target_ticker, normalized, raw_prices = prepare_normalized_data(config_path)
+    (
+        input_target,
+        actual_future,
+        dynamic_covariates,
+        dynamic_categorical_covariates,
+        raw_context,
+        raw_actual_future,
+        raw_base,
+    ) = build_forecast_inputs(
         normalized=normalized,
+        raw_prices=raw_prices,
         target_ticker=target_ticker,
         window=window,
     )
@@ -252,18 +290,25 @@ def run(config_path: Path) -> np.ndarray:
     ) = forecast_with_timesfm(
         input_target=input_target,
         dynamic_numerical_covariates=dynamic_covariates,
+        dynamic_categorical_covariates=dynamic_categorical_covariates,
         window=window,
     )
+    predicted_with_covars_raw = predicted_with_covars * raw_base
+    predicted_no_covars_raw = predicted_no_covars * raw_base
+    p10_with_covars_raw = p10_with_covars * raw_base
+    p90_with_covars_raw = p90_with_covars * raw_base
+    p10_no_covars_raw = p10_no_covars * raw_base
+    p90_no_covars_raw = p90_no_covars * raw_base
     plot_context_and_prediction(
         target_ticker=target_ticker,
-        input_target=input_target,
-        predicted_with_covars=predicted_with_covars,
-        predicted_no_covars=predicted_no_covars,
-        p10_with_covars=p10_with_covars,
-        p90_with_covars=p90_with_covars,
-        p10_no_covars=p10_no_covars,
-        p90_no_covars=p90_no_covars,
-        actual_future=actual_future,
+        context_values=raw_context,
+        predicted_with_covars=predicted_with_covars_raw,
+        predicted_no_covars=predicted_no_covars_raw,
+        p10_with_covars=p10_with_covars_raw,
+        p90_with_covars=p90_with_covars_raw,
+        p10_no_covars=p10_no_covars_raw,
+        p90_no_covars=p90_no_covars_raw,
+        actual_future=raw_actual_future,
     )
     return predicted_with_covars
 
