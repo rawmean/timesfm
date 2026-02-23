@@ -34,10 +34,11 @@ class FineTuneConfig:
     ticker: str = "VTI"
     years_of_history: int = 5
     price_column: str = "Close"
-    context_length: int = 30
+    context_length: int = 64
     horizon: int = 7
+    test_size: int = 120
     batch_size: int = 8
-    num_epochs: int = 5
+    num_epochs: int = 15
     learning_rate: float = 1e-4
     device: str = "auto"
     show_progress: bool = True
@@ -81,6 +82,12 @@ def parse_args() -> FineTuneConfig:
     parser.add_argument("--batch-size", type=int, default=FineTuneConfig.batch_size)
     parser.add_argument("--learning-rate", type=float, default=FineTuneConfig.learning_rate)
     parser.add_argument(
+        "--test-size",
+        type=int,
+        default=FineTuneConfig.test_size,
+        help="Number of latest points held out for final testing (must be >= context_length + horizon).",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         choices=["auto", "mps", "cpu"],
@@ -111,6 +118,7 @@ def parse_args() -> FineTuneConfig:
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        test_size=args.test_size,
         device=args.device,
         show_progress=not args.no_progress,
         tensorboard=not args.no_tensorboard,
@@ -165,6 +173,7 @@ def maybe_create_writer(config: FineTuneConfig):
         (
             f"ticker={config.ticker}, years={config.years_of_history}, "
             f"context={config.context_length}, horizon={config.horizon}, "
+            f"test_size={config.test_size}, "
             f"epochs={config.num_epochs}, batch_size={config.batch_size}, "
             f"learning_rate={config.learning_rate}, device={config.device}"
         ),
@@ -311,8 +320,8 @@ def load_model(config: FineTuneConfig):
     model = timesfm.TimesFM_2p5_200M_torch.from_pretrained(config.model_id)
     model.compile(
         timesfm.ForecastConfig(
-            max_context=1024,
-            max_horizon=256,
+            max_context=config.context_length,
+            max_horizon=config.horizon,
             normalize_inputs=True,
             use_continuous_quantile_head=True,
             force_flip_invariance=True,
@@ -486,8 +495,14 @@ def _save_checkpoint(model, optimizer, training_losses: list[float], config: Fin
     print(f"Saved checkpoint to {config.save_path}\n")
 
 
-def forecast_last_window(model, series: pd.Series, config: FineTuneConfig) -> tuple[np.ndarray, np.ndarray, list[pd.Timestamp]]:
-    context_values = _to_1d_float_array(series.iloc[-config.context_length :])
+def forecast_last_window(
+    model, context_series: pd.Series, future_index: pd.Index, config: FineTuneConfig
+) -> tuple[np.ndarray, np.ndarray, list[pd.Timestamp]]:
+    if len(context_series) < config.context_length:
+        raise ValueError(
+            f"Need at least {config.context_length} context points, got {len(context_series)}."
+        )
+    context_values = _to_1d_float_array(context_series.iloc[-config.context_length :])
     point_forecast, quantile_forecast = model.forecast(
         horizon=config.horizon,
         inputs=[context_values.astype(np.float32)],
@@ -495,10 +510,8 @@ def forecast_last_window(model, series: pd.Series, config: FineTuneConfig) -> tu
 
     pred = np.asarray(point_forecast[0], dtype=float)[-config.horizon :]
     quantiles = np.asarray(quantile_forecast[0], dtype=float)[-config.horizon :, :]
-
-    last_date = pd.Timestamp(series.index[-1])
-    future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=config.horizon)
-    return pred, quantiles, future_dates.to_list()
+    future_dates = pd.DatetimeIndex(future_index).to_list()
+    return pred, quantiles, future_dates
 
 
 def forecast_with_benchmark_covariates(
@@ -506,7 +519,9 @@ def forecast_with_benchmark_covariates(
     config: FineTuneConfig,
 ) -> tuple[np.ndarray, np.ndarray, list[pd.Timestamp], np.ndarray]:
     required = config.context_length + config.horizon
-    lookback_days = max(config.years_of_history * 365, required + 30)
+    lookback_days = max(
+        config.years_of_history * 365, config.test_size + required + config.context_length
+    )
 
     symbols = build_symbol_map(config.ticker)
     close_prices = fetch_daily_close(symbols, lookback_days=lookback_days)
@@ -518,7 +533,6 @@ def forecast_with_benchmark_covariates(
         )
     if len(normalized) < required:
         raise ValueError(f"Need at least {required} rows for covariate forecast, got {len(normalized)}.")
-
     frame = normalized.iloc[-required:].copy()
     raw_frame = close_prices.loc[frame.index].copy()
 
@@ -583,13 +597,20 @@ def plot_covariate_results(
     forecast_dates: list[pd.Timestamp],
     config: FineTuneConfig,
 ) -> None:
-    plot_context_len = min(30, len(context_values))
+    plot_context_len = min(config.context_length, len(context_values))
     context_tail = np.asarray(context_values[-plot_context_len:], dtype=float)
     x_context = np.arange(plot_context_len)
     x_forecast = np.arange(plot_context_len, plot_context_len + len(pred_covars))
+    context_label_len = min(config.context_length, len(context_values))
 
     plt.figure(figsize=(12, 5))
-    plt.plot(x_context, context_tail, marker="o", linewidth=2, label="Context (last 30)")
+    plt.plot(
+        x_context,
+        context_tail,
+        marker="o",
+        linewidth=2,
+        label=f"Context (last {context_label_len})",
+    )
     plt.plot(
         x_forecast,
         pred_covars,
@@ -622,18 +643,45 @@ def plot_covariate_results(
 def main() -> None:
     config = parse_args()
     series = fetch_ticker_history(config)
+    min_test_size = config.context_length + config.horizon
+    if config.test_size < min_test_size:
+        raise ValueError(
+            f"test_size ({config.test_size}) must be >= context_length + horizon "
+            f"({config.context_length} + {config.horizon} = {min_test_size})."
+        )
+    if len(series) < config.context_length + config.test_size + 1:
+        raise ValueError(
+            f"Not enough data for split. Need at least {config.context_length + config.test_size + 1}, got {len(series)}."
+        )
 
-    # Hold out the latest horizon for simple sanity-check reporting.
-    train_series = series.iloc[: -config.horizon]
+    # Hold out an explicit test set. Final forecast is evaluated on unseen tail points.
+    train_series = series.iloc[: -config.test_size]
+    test_series = series.iloc[-config.test_size :]
     holdout_series = series.iloc[-config.horizon :]
+    eval_context = series.iloc[-(config.context_length + config.horizon) : -config.horizon]
+    split_date = pd.Timestamp(train_series.index[-1])
+    print(
+        f"Train/test split at {split_date.strftime('%Y-%m-%d')} | "
+        f"train={len(train_series)} points, test={len(test_series)} points"
+    )
+    print(
+        f"Final evaluation window (tail): "
+        f"{holdout_series.index[0].strftime('%Y-%m-%d')} to "
+        f"{holdout_series.index[-1].strftime('%Y-%m-%d')}"
+    )
 
     model, device = load_model(config)
     model, losses = finetune_model(
         model, train_series.to_numpy(dtype=np.float32), config, device
     )
 
-    print("\nGenerating forecast from the latest 30-day context...")
-    pred, quantiles, future_dates = forecast_last_window(model, train_series, config)
+    print(f"\nGenerating forecast from the latest {config.context_length}-day context...")
+    pred, quantiles, future_dates = forecast_last_window(
+        model,
+        context_series=eval_context,
+        future_index=holdout_series.index,
+        config=config,
+    )
 
     print("\nForecast summary")
     print("=" * 70)
