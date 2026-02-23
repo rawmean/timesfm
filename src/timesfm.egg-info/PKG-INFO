@@ -13,6 +13,8 @@ Requires-Dist: safetensors>=0.5.3
 Requires-Dist: yfinance>=1.2.0
 Requires-Dist: matplotlib>=3.10.8
 Requires-Dist: pandas>=2.3.3
+Requires-Dist: tensorboard>=2.20.0
+Requires-Dist: setuptools>=82.0.0
 Provides-Extra: torch
 Requires-Dist: torch>=2.0.0; extra == "torch"
 Provides-Extra: flax

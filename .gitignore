@@ -8,3 +8,6 @@ results/
 timesfm_jax.egg-info/
 development_setup.md
 *.pt
+events.out.tfevents.*
+runs/
+myStuff/runs/

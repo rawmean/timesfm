@@ -22,6 +22,11 @@ try:
 except Exception:  # pragma: no cover - fallback when tqdm is unavailable
     tqdm = None
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover - fallback when tensorboard is unavailable
+    SummaryWriter = None
+
 
 @dataclass(frozen=True)
 class FineTuneConfig:
@@ -35,6 +40,8 @@ class FineTuneConfig:
     learning_rate: float = 1e-4
     device: str = "auto"
     show_progress: bool = True
+    tensorboard: bool = True
+    log_dir: Path = Path("myStuff/runs")
     model_id: str = "google/timesfm-2.5-200m-pytorch"
     save_path: Path = Path("myStuff/finetuned_timesfm_yfinance.pt")
 
@@ -84,6 +91,17 @@ def parse_args() -> FineTuneConfig:
         action="store_true",
         help="Disable tqdm progress bars.",
     )
+    parser.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="Disable TensorBoard logging.",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=FineTuneConfig.log_dir,
+        help="TensorBoard log directory.",
+    )
     parser.add_argument("--save-path", type=Path, default=FineTuneConfig.save_path)
     args = parser.parse_args()
 
@@ -94,6 +112,8 @@ def parse_args() -> FineTuneConfig:
         learning_rate=args.learning_rate,
         device=args.device,
         show_progress=not args.no_progress,
+        tensorboard=not args.no_tensorboard,
+        log_dir=args.log_dir,
         save_path=args.save_path,
     )
 
@@ -124,6 +144,29 @@ def maybe_tqdm(iterable, enabled: bool, **kwargs):
     if enabled and tqdm is not None:
         return tqdm(iterable, **kwargs)
     return iterable
+
+
+def maybe_create_writer(config: FineTuneConfig):
+    if not config.tensorboard:
+        return None
+    if SummaryWriter is None:
+        print("TensorBoard disabled: torch.utils.tensorboard is not available.")
+        return None
+    run_name = (
+        f"{config.ticker}_ctx{config.context_length}_hor{config.horizon}_"
+        f"ep{config.num_epochs}_bs{config.batch_size}_lr{config.learning_rate}"
+    )
+    writer = SummaryWriter(log_dir=str(config.log_dir / run_name))
+    writer.add_text(
+        "run/config",
+        (
+            f"ticker={config.ticker}, years={config.years_of_history}, "
+            f"context={config.context_length}, horizon={config.horizon}, "
+            f"epochs={config.num_epochs}, batch_size={config.batch_size}, "
+            f"learning_rate={config.learning_rate}, device={config.device}"
+        ),
+    )
+    return writer
 
 
 def fetch_ticker_history(config: FineTuneConfig) -> pd.Series:
@@ -249,6 +292,8 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
     optimizer = optim.Adam(trainable_params, lr=config.learning_rate)
     criterion = nn.MSELoss()
     training_losses: list[float] = []
+    writer = maybe_create_writer(config)
+    global_step = 0
 
     epoch_iter = maybe_tqdm(
         range(config.num_epochs),
@@ -286,16 +331,29 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
                 loss.backward()
                 optimizer.step()
                 epoch_losses.append(float(loss.item()))
+                if writer is not None:
+                    writer.add_scalar("train/batch_loss", float(loss.item()), global_step)
+                    global_step += 1
                 if config.show_progress and tqdm is not None:
                     batch_iter.set_postfix(loss=f"{loss.item():.5f}")
             except Exception as exc:
                 print(f"Training stopped at epoch {epoch + 1}, batch {batch_idx}: {exc}")
                 print("Using pretrained model for inference only.")
+                if writer is not None:
+                    writer.close()
                 return model, []
 
         avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
         training_losses.append(avg_loss)
+        if writer is not None:
+            writer.add_scalar("train/epoch_loss", avg_loss, epoch + 1)
+            writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], epoch + 1)
         print(f"Epoch {epoch + 1}/{config.num_epochs}, average loss: {avg_loss:.6f}")
+
+    if writer is not None:
+        writer.flush()
+        writer.close()
+        print(f"TensorBoard logs written to: {config.log_dir}")
 
     _save_checkpoint(model, optimizer, training_losses, config)
     return model, training_losses

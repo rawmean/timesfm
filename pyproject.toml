@@ -19,6 +19,8 @@ dependencies = [
     "yfinance>=1.2.0",
     "matplotlib>=3.10.8",
     "pandas>=2.3.3",
+    "tensorboard>=2.20.0",
+    "setuptools>=82.0.0",
 ]
 
 [project.optional-dependencies]
