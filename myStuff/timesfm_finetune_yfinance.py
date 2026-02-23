@@ -16,6 +16,7 @@ import yfinance as yf
 from torch.utils.data import DataLoader, Dataset
 
 from equity_benchmark_compare import build_symbol_map, fetch_daily_close, normalize_from_start
+from timesfm.torch.util import revin, update_running_stats
 
 try:
     from tqdm.auto import tqdm
@@ -152,10 +153,12 @@ def maybe_create_writer(config: FineTuneConfig):
     if SummaryWriter is None:
         print("TensorBoard disabled: torch.utils.tensorboard is not available.")
         return None
-    run_name = (
+    run_name_base = (
         f"{config.ticker}_ctx{config.context_length}_hor{config.horizon}_"
         f"ep{config.num_epochs}_bs{config.batch_size}_lr{config.learning_rate}"
     )
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{run_name_base}_{run_ts}"
     writer = SummaryWriter(log_dir=str(config.log_dir / run_name))
     writer.add_text(
         "run/config",
@@ -167,6 +170,85 @@ def maybe_create_writer(config: FineTuneConfig):
         ),
     )
     return writer
+
+
+def gradient_diagnostics(module: torch.nn.Module) -> tuple[int, int, float, float]:
+    total_params = 0
+    params_with_grad = 0
+    total_grad_norm = 0.0
+    max_abs_grad = 0.0
+    for param in module.parameters():
+        if not param.requires_grad:
+            continue
+        total_params += 1
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        if grad.numel() == 0:
+            continue
+        params_with_grad += 1
+        total_grad_norm += float(torch.norm(grad).item())
+        max_abs_grad = max(max_abs_grad, float(torch.max(torch.abs(grad)).item()))
+    return total_params, params_with_grad, total_grad_norm, max_abs_grad
+
+
+def differentiable_point_forecast(
+    module: torch.nn.Module, context: torch.Tensor, horizon: int
+) -> torch.Tensor:
+    """Differentiable point forecast for short horizons using module forward pass.
+
+    This bypasses the public `forecast()/decode()` path, which is inference-only.
+    """
+    if horizon > module.o:
+        raise ValueError(
+            f"Differentiable helper supports horizon <= output patch ({module.o}), got {horizon}."
+        )
+    if context.ndim != 2:
+        raise ValueError(f"Expected context shape [B, T], got {tuple(context.shape)}")
+
+    batch_size, context_len = context.shape
+    patch_len = module.p
+    padded_len = int(np.ceil(context_len / patch_len) * patch_len)
+    pad_len = padded_len - context_len
+
+    if pad_len > 0:
+        pad_values = torch.zeros(batch_size, pad_len, device=context.device, dtype=context.dtype)
+        values = torch.cat([pad_values, context], dim=1)
+        pad_mask = torch.ones(batch_size, pad_len, device=context.device, dtype=torch.bool)
+        value_mask = torch.zeros(batch_size, context_len, device=context.device, dtype=torch.bool)
+        masks = torch.cat([pad_mask, value_mask], dim=1)
+    else:
+        values = context
+        masks = torch.zeros_like(values, dtype=torch.bool)
+
+    patched_inputs = values.reshape(batch_size, -1, patch_len)
+    patched_masks = masks.reshape(batch_size, -1, patch_len)
+
+    n = torch.zeros(batch_size, device=context.device)
+    mu = torch.zeros(batch_size, device=context.device)
+    sigma = torch.zeros(batch_size, device=context.device)
+    patch_mu: list[torch.Tensor] = []
+    patch_sigma: list[torch.Tensor] = []
+    for i in range(patched_inputs.shape[1]):
+        (n, mu, sigma), _ = update_running_stats(
+            n, mu, sigma, patched_inputs[:, i], patched_masks[:, i]
+        )
+        patch_mu.append(mu)
+        patch_sigma.append(sigma)
+
+    context_mu = torch.stack(patch_mu, dim=1)
+    context_sigma = torch.stack(patch_sigma, dim=1)
+
+    normed_inputs = revin(patched_inputs, context_mu, context_sigma, reverse=False)
+    normed_inputs = torch.where(patched_masks, 0.0, normed_inputs)
+
+    (_, _, normed_outputs, _), _ = module(normed_inputs, patched_masks, decode_caches=None)
+    renormed_outputs = torch.reshape(
+        revin(normed_outputs, context_mu, context_sigma, reverse=True),
+        (batch_size, -1, module.o, module.q),
+    )
+
+    return renormed_outputs[:, -1, :horizon, module.aridx]
 
 
 def fetch_ticker_history(config: FineTuneConfig) -> pd.Series:
@@ -282,6 +364,7 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
         )
 
     pytorch_model = _extract_torch_model(model)
+    pytorch_model.train()
     trainable_params = [p for p in pytorch_model.parameters() if p.requires_grad]
     if not trainable_params:
         print("No trainable parameters were marked; unfreezing all parameters.")
@@ -303,6 +386,10 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
     )
     for epoch in epoch_iter:
         epoch_losses = []
+        epoch_grad_params = 0
+        epoch_total_params = 0
+        epoch_grad_norms: list[float] = []
+        epoch_grad_max: list[float] = []
         batch_iter = maybe_tqdm(
             train_loader,
             enabled=config.show_progress,
@@ -312,23 +399,26 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
         )
         for batch_idx, (context, target) in enumerate(batch_iter):
             try:
-                batch_inputs = [_to_1d_float_array(context[i].numpy()) for i in range(context.shape[0])]
-                pred, _ = model.forecast(
-                    horizon=config.horizon,
-                    inputs=batch_inputs,
-                )
-                pred_arr = np.asarray(pred, dtype=np.float32)
-                if pred_arr.ndim == 1:
-                    pred_arr = pred_arr[None, :]
-                pred_arr = pred_arr[:, -config.horizon :]
-                pred_tensor = torch.tensor(
-                    pred_arr, dtype=torch.float32, device=device, requires_grad=True
-                )
+                context = context.to(device=device, dtype=torch.float32)
                 target = target.to(device=device, dtype=torch.float32)
+                pred_tensor = differentiable_point_forecast(
+                    pytorch_model, context=context, horizon=config.horizon
+                )
 
                 loss = criterion(pred_tensor, target)
                 optimizer.zero_grad()
                 loss.backward()
+                total_params, params_with_grad, grad_norm, grad_max_abs = gradient_diagnostics(
+                    pytorch_model
+                )
+                epoch_total_params = max(epoch_total_params, total_params)
+                epoch_grad_params = max(epoch_grad_params, params_with_grad)
+                epoch_grad_norms.append(grad_norm)
+                epoch_grad_max.append(grad_max_abs)
+                if writer is not None:
+                    writer.add_scalar("debug/params_with_grad", params_with_grad, global_step)
+                    writer.add_scalar("debug/grad_norm_sum", grad_norm, global_step)
+                    writer.add_scalar("debug/grad_max_abs", grad_max_abs, global_step)
                 optimizer.step()
                 epoch_losses.append(float(loss.item()))
                 if writer is not None:
@@ -339,22 +429,32 @@ def finetune_model(model, train_data: np.ndarray, config: FineTuneConfig, device
             except Exception as exc:
                 print(f"Training stopped at epoch {epoch + 1}, batch {batch_idx}: {exc}")
                 print("Using pretrained model for inference only.")
+                pytorch_model.eval()
                 if writer is not None:
                     writer.close()
                 return model, []
 
         avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+        avg_grad_norm = float(np.mean(epoch_grad_norms)) if epoch_grad_norms else 0.0
+        max_grad_abs = float(np.max(epoch_grad_max)) if epoch_grad_max else 0.0
         training_losses.append(avg_loss)
         if writer is not None:
             writer.add_scalar("train/epoch_loss", avg_loss, epoch + 1)
             writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], epoch + 1)
+            writer.add_scalar("debug/epoch_avg_grad_norm_sum", avg_grad_norm, epoch + 1)
+            writer.add_scalar("debug/epoch_max_abs_grad", max_grad_abs, epoch + 1)
         print(f"Epoch {epoch + 1}/{config.num_epochs}, average loss: {avg_loss:.6f}")
+        print(
+            f"Gradient diagnostic: params_with_grad={epoch_grad_params}/{epoch_total_params}, "
+            f"avg_grad_norm_sum={avg_grad_norm:.6e}, max_abs_grad={max_grad_abs:.6e}"
+        )
 
     if writer is not None:
         writer.flush()
         writer.close()
         print(f"TensorBoard logs written to: {config.log_dir}")
 
+    pytorch_model.eval()
     _save_checkpoint(model, optimizer, training_losses, config)
     return model, training_losses
 
