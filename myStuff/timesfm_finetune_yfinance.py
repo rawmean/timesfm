@@ -34,6 +34,7 @@ class FineTuneConfig:
     ticker: str = "VTI"
     years_of_history: int = 5
     price_column: str = "Close"
+    moving_average_window: int = 5
     context_length: int = 64
     horizon: int = 7
     test_size: int = 120
@@ -41,7 +42,7 @@ class FineTuneConfig:
     batch_size: int = 8
     num_epochs: int = 15
     learning_rate: float = 1e-4
-    finetune_mode: str = "peft"
+    finetune_mode: str = "full"
     peft_last_n_layers: int = 2
     device: str = "auto"
     show_progress: bool = True
@@ -84,6 +85,12 @@ def parse_args() -> FineTuneConfig:
     parser.add_argument("--epochs", type=int, default=FineTuneConfig.num_epochs)
     parser.add_argument("--batch-size", type=int, default=FineTuneConfig.batch_size)
     parser.add_argument("--learning-rate", type=float, default=FineTuneConfig.learning_rate)
+    parser.add_argument(
+        "--moving-average-window",
+        type=int,
+        default=FineTuneConfig.moving_average_window,
+        help="Window size for moving-average target (set 5 for MA5).",
+    )
     parser.add_argument(
         "--finetune-mode",
         type=str,
@@ -137,6 +144,7 @@ def parse_args() -> FineTuneConfig:
 
     return FineTuneConfig(
         ticker=args.ticker.upper(),
+        moving_average_window=args.moving_average_window,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -199,6 +207,7 @@ def maybe_create_writer(config: FineTuneConfig):
             f"ticker={config.ticker}, years={config.years_of_history}, "
             f"context={config.context_length}, horizon={config.horizon}, "
             f"test_size={config.test_size}, val_fraction={config.val_fraction}, "
+            f"moving_average_window={config.moving_average_window}, "
             f"finetune_mode={config.finetune_mode}, peft_last_n_layers={config.peft_last_n_layers}, "
             f"epochs={config.num_epochs}, batch_size={config.batch_size}, "
             f"learning_rate={config.learning_rate}, device={config.device}"
@@ -360,14 +369,21 @@ def fetch_ticker_history(config: FineTuneConfig) -> pd.Series:
         series = series.iloc[:, 0]
 
     series = series.astype(float).copy()
-    series.name = config.ticker
+    ma_window = config.moving_average_window
+    if ma_window < 1:
+        raise ValueError(f"moving_average_window must be >= 1, got {ma_window}.")
+    series = series.rolling(window=ma_window, min_periods=ma_window).mean().dropna()
+    series.name = f"{config.ticker}_MA{ma_window}"
     if len(series) < config.context_length + config.horizon + 1:
         raise ValueError(
             f"Not enough data points ({len(series)}). Need at least "
             f"{config.context_length + config.horizon + 1}."
         )
 
-    print(f"Downloaded {len(series)} daily points.")
+    print(
+        f"Downloaded and transformed to {config.price_column} MA{ma_window} "
+        f"with {len(series)} daily points."
+    )
     return series
 
 
@@ -643,17 +659,29 @@ def forecast_with_benchmark_covariates(
             f"Ticker '{config.ticker}' not found in normalized benchmark frame columns: "
             f"{normalized.columns.tolist()}"
         )
-    if len(normalized) < required:
-        raise ValueError(f"Need at least {required} rows for covariate forecast, got {len(normalized)}.")
-    frame = normalized.iloc[-required:].copy()
-    raw_frame = close_prices.loc[frame.index].copy()
+    target_ma = (
+        close_prices[config.ticker]
+        .astype(float)
+        .rolling(
+            window=config.moving_average_window,
+            min_periods=config.moving_average_window,
+        )
+        .mean()
+        .dropna()
+    )
+    if len(target_ma) < required:
+        raise ValueError(
+            f"Need at least {required} MA points for covariate forecast, got {len(target_ma)}."
+        )
+    frame = normalized.loc[target_ma.index].iloc[-required:].copy()
+    target_ma = target_ma.loc[frame.index]
 
-    base_row = frame.iloc[0].replace(0.0, np.nan)
-    frame = frame.divide(base_row).ffill().bfill()
-
-    target_series = frame[config.ticker].to_numpy(dtype=np.float32)
+    base = float(target_ma.iloc[0])
+    if base == 0.0:
+        raise ValueError("MA target base value is zero, cannot normalize for covariate forecast.")
+    target_series = (target_ma / base).to_numpy(dtype=np.float32)
     input_target = target_series[: config.context_length]
-    raw_target = raw_frame[config.ticker].to_numpy(dtype=float)
+    raw_target = target_ma.to_numpy(dtype=float)
     raw_context = raw_target[: config.context_length]
     raw_actual_future = raw_target[config.context_length :]
     raw_base = float(raw_context[0])
@@ -683,7 +711,13 @@ def forecast_with_benchmark_covariates(
 def plot_results(series: pd.Series, pred: np.ndarray, quantiles: np.ndarray, future_dates: list[pd.Timestamp], config: FineTuneConfig) -> None:
     recent = series.iloc[-120:]
     plt.figure(figsize=(13, 6))
-    plt.plot(recent.index, recent.values, label="Historical Close", color="black", linewidth=2)
+    plt.plot(
+        recent.index,
+        recent.values,
+        label=f"Historical {config.price_column} MA{config.moving_average_window}",
+        color="black",
+        linewidth=2,
+    )
     plt.plot(future_dates, pred, label="7-day forecast", color="tab:red", linewidth=2, marker="o")
     plt.fill_between(
         future_dates,
@@ -693,7 +727,10 @@ def plot_results(series: pd.Series, pred: np.ndarray, quantiles: np.ndarray, fut
         alpha=0.2,
         label="p10-p90",
     )
-    plt.title(f"{config.ticker} TimesFM forecast after fine-tuning")
+    plt.title(
+        f"{config.ticker} TimesFM forecast after fine-tuning "
+        f"({config.price_column} MA{config.moving_average_window})"
+    )
     plt.xlabel("Date")
     plt.ylabel(config.price_column)
     plt.grid(alpha=0.3)
