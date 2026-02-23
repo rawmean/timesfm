@@ -17,6 +17,9 @@ from equity_benchmark_compare import (
     normalize_from_start,
 )
 
+VIX_COVARIATE_NAME = "VIX"
+VIX_SYMBOL = "^VIX"
+
 
 @dataclass(frozen=True)
 class ForecastWindow:
@@ -40,6 +43,7 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
 def prepare_normalized_data(config_path: Path) -> tuple[str, pd.DataFrame, pd.DataFrame]:
     config = load_config(config_path)
     symbols = build_symbol_map(config.ticker)
+    symbols[VIX_COVARIATE_NAME] = VIX_SYMBOL
     close_prices = fetch_daily_close(symbols, config.lookback_days)
     normalized = normalize_from_start(close_prices).dropna()
     raw_aligned = close_prices.loc[normalized.index].copy()
@@ -54,7 +58,7 @@ def build_forecast_inputs(
 ) -> tuple[
     list[float],
     np.ndarray,
-    dict[str, list[list[float]]],
+    dict[str, list[list[float]]] | None,
     dict[str, list[list[int]]],
     np.ndarray,
     np.ndarray,
@@ -78,40 +82,14 @@ def build_forecast_inputs(
     raw_context = raw_target_series[: window.context_len]
     raw_actual_future = raw_target_series[window.context_len :]
     raw_base = float(raw_context[0])
-    full_target_rsi = compute_rsi(frame[target_ticker], period=14)
-    rsi_frame = full_target_rsi.to_numpy(dtype=float)
-
-    dynamic_numerical_covariates: dict[str, list[list[float]]] = {}
-    for name in BENCHMARK_TICKERS:
-        benchmark_series = frame[name].to_numpy(dtype=float)
-        benchmark_context = benchmark_series[: window.context_len]
-        last_known = benchmark_context[-1]
-        future_proxy = np.full(window.horizon_len, last_known, dtype=float)
-        strict_realtime_covariate = np.concatenate([benchmark_context, future_proxy])
-        dynamic_numerical_covariates[name] = [strict_realtime_covariate.tolist()]
-
-        benchmark_rsi = compute_rsi(frame[name], period=14).to_numpy(dtype=float)
-        benchmark_rsi_context = benchmark_rsi[: window.context_len]
-        benchmark_rsi_last_known = benchmark_rsi_context[-1]
-        benchmark_rsi_future_proxy = np.full(
-            window.horizon_len, benchmark_rsi_last_known, dtype=float
-        )
-        strict_realtime_benchmark_rsi = np.concatenate(
-            [benchmark_rsi_context, benchmark_rsi_future_proxy]
-        )
-        dynamic_numerical_covariates[f"{name}_RSI_14"] = [
-            strict_realtime_benchmark_rsi.tolist()
-        ]
-
-    rsi_context = rsi_frame[: window.context_len]
-    rsi_last_known = rsi_context[-1]
-    rsi_future_proxy = np.full(window.horizon_len, rsi_last_known, dtype=float)
-    strict_realtime_rsi = np.concatenate([rsi_context, rsi_future_proxy])
-    dynamic_numerical_covariates["Target_RSI_14"] = [strict_realtime_rsi.tolist()]
+    # Unknown future market covariates are intentionally omitted from xreg.
+    dynamic_numerical_covariates = None
 
     day_of_week = frame.index.dayofweek.to_numpy(dtype=int)
+    month_of_year = frame.index.month.to_numpy(dtype=int)
     dynamic_categorical_covariates: dict[str, list[list[int]]] = {
-        "DayOfWeek": [day_of_week.tolist()]
+        "DayOfWeek": [day_of_week.tolist()],
+        "MonthOfYear": [month_of_year.tolist()],
     }
 
     return (
@@ -127,7 +105,7 @@ def build_forecast_inputs(
 
 def forecast_with_timesfm(
     input_target: list[float],
-    dynamic_numerical_covariates: dict[str, list[list[float]]],
+    dynamic_numerical_covariates: dict[str, list[list[float]]] | None,
     dynamic_categorical_covariates: dict[str, list[list[int]]],
     window: ForecastWindow,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -151,7 +129,7 @@ def forecast_with_timesfm(
         inputs=[input_target],
         dynamic_numerical_covariates=dynamic_numerical_covariates,
         dynamic_categorical_covariates=dynamic_categorical_covariates,
-        xreg_mode="xreg + timesfm",
+        xreg_mode="timesfm + xreg",
         ridge=0.0,
         normalize_xreg_target_per_input=True,
     )
