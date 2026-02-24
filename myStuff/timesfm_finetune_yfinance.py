@@ -613,7 +613,7 @@ def finetune_model(
                 pytorch_model.eval()
                 if writer is not None:
                     writer.close()
-                return model, []
+                return model, [], []
 
         avg_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
         val_loss = evaluate_loader_loss(
@@ -646,6 +646,39 @@ def finetune_model(
     pytorch_model.eval()
     _save_checkpoint(model, optimizer, training_losses, validation_losses, config)
     return model, training_losses, validation_losses
+
+
+def load_checkpoint_if_available(model, checkpoint_path: Path) -> bool:
+    if not checkpoint_path.exists():
+        return False
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state = checkpoint.get("model_state_dict", {})
+        if not state:
+            print(f"Checkpoint found at {checkpoint_path}, but model_state_dict is empty.")
+            return False
+        internal_model = _extract_torch_model(model)
+        missing, unexpected = internal_model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"Warning: {len(missing)} missing keys while loading checkpoint.")
+        if unexpected:
+            print(f"Warning: {len(unexpected)} unexpected keys while loading checkpoint.")
+        print(f"Loaded fine-tuned checkpoint: {checkpoint_path}")
+        return True
+    except Exception as exc:
+        print(f"Failed to load checkpoint {checkpoint_path}: {exc}")
+        return False
+
+
+def prompt_yes_no(question: str, default_no: bool = True) -> bool:
+    suffix = " [y/N]: " if default_no else " [Y/n]: "
+    try:
+        answer = input(question + suffix).strip().lower()
+    except EOFError:
+        return not default_no
+    if not answer:
+        return not default_no
+    return answer in {"y", "yes"}
 
 
 def _save_checkpoint(
@@ -814,7 +847,15 @@ def forecast_with_benchmark_covariates(
     return pred_raw, raw_actual_future, forecast_dates, raw_context
 
 
-def plot_results(series: pd.Series, pred: np.ndarray, quantiles: np.ndarray, future_dates: list[pd.Timestamp], config: FineTuneConfig) -> None:
+def plot_results(
+    series: pd.Series,
+    pred_finetuned: np.ndarray,
+    quantiles_finetuned: np.ndarray,
+    pred_base: np.ndarray,
+    quantiles_base: np.ndarray,
+    future_dates: list[pd.Timestamp],
+    config: FineTuneConfig,
+) -> None:
     recent = series.iloc[-120:]
     plt.figure(figsize=(13, 6))
     plt.plot(
@@ -824,14 +865,38 @@ def plot_results(series: pd.Series, pred: np.ndarray, quantiles: np.ndarray, fut
         color="black",
         linewidth=2,
     )
-    plt.plot(future_dates, pred, label="7-day forecast", color="tab:red", linewidth=2, marker="o")
+    plt.plot(
+        future_dates,
+        pred_finetuned,
+        label="Fine-tuned forecast",
+        color="tab:red",
+        linewidth=2,
+        marker="o",
+    )
     plt.fill_between(
         future_dates,
-        quantiles[:, 1],
-        quantiles[:, 9],
+        quantiles_finetuned[:, 1],
+        quantiles_finetuned[:, 9],
         color="tab:red",
         alpha=0.2,
-        label="p10-p90",
+        label="Fine-tuned p10-p90",
+    )
+    plt.plot(
+        future_dates,
+        pred_base,
+        label="Base model forecast",
+        color="tab:blue",
+        linewidth=2,
+        marker="s",
+        linestyle="--",
+    )
+    plt.fill_between(
+        future_dates,
+        quantiles_base[:, 1],
+        quantiles_base[:, 9],
+        color="tab:blue",
+        alpha=0.15,
+        label="Base p10-p90",
     )
     plt.title(
         f"{config.ticker} TimesFM forecast after fine-tuning "
@@ -939,33 +1004,75 @@ def main() -> None:
     )
 
     model, device = load_model(config)
-    model, losses, val_losses = finetune_model(
-        model,
-        train_series.to_numpy(dtype=np.float32),
-        val_series.to_numpy(dtype=np.float32),
-        config,
-        device,
-    )
+    losses: list[float] = []
+    val_losses: list[float] = []
+    if config.save_path.exists():
+        retrain = prompt_yes_no(
+            f"Found existing fine-tuned checkpoint at {config.save_path}. Fine-tune again?",
+            default_no=True,
+        )
+        if retrain:
+            model, losses, val_losses = finetune_model(
+                model,
+                train_series.to_numpy(dtype=np.float32),
+                val_series.to_numpy(dtype=np.float32),
+                config,
+                device,
+            )
+        else:
+            loaded = load_checkpoint_if_available(model, config.save_path)
+            if not loaded:
+                print("Checkpoint load failed; proceeding with fresh fine-tuning.")
+                model, losses, val_losses = finetune_model(
+                    model,
+                    train_series.to_numpy(dtype=np.float32),
+                    val_series.to_numpy(dtype=np.float32),
+                    config,
+                    device,
+                )
+    else:
+        model, losses, val_losses = finetune_model(
+            model,
+            train_series.to_numpy(dtype=np.float32),
+            val_series.to_numpy(dtype=np.float32),
+            config,
+            device,
+        )
 
     print(f"\nGenerating forecast from the latest {config.context_length}-day context...")
-    pred, quantiles, future_dates = forecast_last_window(
+    pred_finetuned, quantiles_finetuned, future_dates = forecast_last_window(
         model,
         context_series=eval_context,
         future_index=holdout_series.index,
         config=config,
     )
+    base_model, _ = load_model(config)
+    pred_base, quantiles_base, _ = forecast_last_window(
+        base_model,
+        context_series=eval_context,
+        future_index=holdout_series.index,
+        config=config,
+    )
 
-    print("\nForecast summary")
+    print("\nForecast summary (fine-tuned vs base)")
     print("=" * 70)
     for i in range(config.horizon):
         date_str = future_dates[i].strftime("%Y-%m-%d")
-        p10 = quantiles[i, 1]
-        p90 = quantiles[i, 9]
+        p10_ft = quantiles_finetuned[i, 1]
+        p90_ft = quantiles_finetuned[i, 9]
+        p10_base = quantiles_base[i, 1]
+        p90_base = quantiles_base[i, 9]
         actual = holdout_series.iloc[i] if i < len(holdout_series) else float("nan")
         print(
-            f"{date_str}: pred={pred[i]:.2f}, p10={p10:.2f}, p90={p90:.2f}, "
+            f"{date_str}: finetuned={pred_finetuned[i]:.2f} "
+            f"(p10={p10_ft:.2f}, p90={p90_ft:.2f}), "
+            f"base={pred_base[i]:.2f} (p10={p10_base:.2f}, p90={p90_base:.2f}), "
             f"actual={float(actual):.2f}"
         )
+    actual_vals = holdout_series.to_numpy(dtype=float)
+    mae_finetuned = float(np.mean(np.abs(pred_finetuned - actual_vals)))
+    mae_base = float(np.mean(np.abs(pred_base - actual_vals)))
+    print(f"\nMAE over horizon | fine-tuned: {mae_finetuned:.4f} | base: {mae_base:.4f}")
 
     if losses:
         plt.figure(figsize=(9, 4))
@@ -995,7 +1102,15 @@ def main() -> None:
     except Exception as exc:
         print(f"Covariate forecast failed: {exc}")
 
-    plot_results(series, pred, quantiles, future_dates, config)
+    plot_results(
+        series=series,
+        pred_finetuned=pred_finetuned,
+        quantiles_finetuned=quantiles_finetuned,
+        pred_base=pred_base,
+        quantiles_base=quantiles_base,
+        future_dates=future_dates,
+        config=config,
+    )
 
 
 if __name__ == "__main__":
