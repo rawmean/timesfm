@@ -43,10 +43,10 @@ class FineTuneConfig:
     ticker: str = "VTI"
     years_of_history: int = 5
     price_column: str = "Close"
-    moving_average_window: int = 5
+    moving_average_window: int = 7
     use_calendar_covariates: bool = False
     covariate_boundary_correction: bool = True
-    context_length: int = 64
+    context_length: int = 32
     horizon: int = 7
     test_size: int = 120
     val_fraction: float = 0.15
