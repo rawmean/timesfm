@@ -13,6 +13,10 @@ import torch
 import yfinance as yf
 
 
+VALUE_METRIC_POSITIVE_RETURN = 0.05
+VALUE_METRIC_SIGMOID_TARGET = 0.8
+
+
 @dataclass(frozen=True)
 class PlotConfig:
     checkpoint: Path | None = None
@@ -233,6 +237,19 @@ def forecast_latest_window(
     return pred, quantiles, future_dates, context_series
 
 
+def compute_value_metric(current_value: float, last_predicted_value: float) -> tuple[float, float]:
+    if current_value == 0.0:
+        raise ValueError("Current value is zero; cannot compute return-based value metric.")
+
+    implied_return = (last_predicted_value - current_value) / current_value
+    # Calibrate sigmoid so that +5% -> 0.8 and -5% -> 0.2.
+    sigmoid_scale = np.log(VALUE_METRIC_SIGMOID_TARGET / (1.0 - VALUE_METRIC_SIGMOID_TARGET))
+    sigmoid_scale = float(sigmoid_scale / VALUE_METRIC_POSITIVE_RETURN)
+    sigmoid_value = 1.0 / (1.0 + np.exp(-sigmoid_scale * implied_return))
+    value_metric = 100.0 * float(sigmoid_value)
+    return value_metric, float(implied_return)
+
+
 def plot_context_and_forecast(
     ticker: str,
     ma_window: int,
@@ -240,6 +257,8 @@ def plot_context_and_forecast(
     pred: np.ndarray,
     quantiles: np.ndarray,
     future_dates: pd.DatetimeIndex,
+    value_metric: float,
+    implied_return: float,
 ) -> None:
     plt.figure(figsize=(13, 6))
     plt.plot(
@@ -271,6 +290,14 @@ def plot_context_and_forecast(
     plt.title(f"{ticker} MA{ma_window}: Last {len(context_series)} Context Days + {len(pred)}-Day Forecast")
     plt.xlabel("Date")
     plt.ylabel("Moving Average")
+    plt.text(
+        0.02,
+        0.98,
+        f"Value metric: {value_metric:.1f}/100\nLast-step return: {implied_return * 100:.2f}%",
+        transform=plt.gca().transAxes,
+        verticalalignment="top",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+    )
     plt.grid(alpha=0.3)
     plt.legend(loc="best")
     plt.tight_layout()
@@ -310,6 +337,12 @@ def main() -> None:
         context_len=context_len,
         horizon=horizon,
     )
+    current_value = float(context_series.iloc[-1])
+    last_predicted_value = float(pred[-1])
+    value_metric, implied_return = compute_value_metric(
+        current_value=current_value,
+        last_predicted_value=last_predicted_value,
+    )
 
     print("\nForecast values:")
     for i in range(horizon):
@@ -317,6 +350,11 @@ def main() -> None:
             f"{future_dates[i].strftime('%Y-%m-%d')}: "
             f"pred={pred[i]:.2f}, p10={quantiles[i, 1]:.2f}, p90={quantiles[i, 9]:.2f}"
         )
+    print(
+        f"\nValue metric: {value_metric:.2f}/100 "
+        f"(current={current_value:.2f}, last_pred={last_predicted_value:.2f}, "
+        f"last-step return={implied_return * 100:.2f}%)"
+    )
 
     plot_context_and_forecast(
         ticker=ticker,
@@ -325,6 +363,8 @@ def main() -> None:
         pred=pred,
         quantiles=quantiles,
         future_dates=future_dates,
+        value_metric=value_metric,
+        implied_return=implied_return,
     )
 
 

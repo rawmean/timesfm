@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,6 +55,7 @@ class FineTuneConfig:
     batch_size: int = 32
     num_epochs: int = 15
     learning_rate: float = 1e-4
+    seed: int = 42
     finetune_mode: str = "peft"
     peft_last_n_layers: int = 2
     device: str = "auto"
@@ -113,6 +115,12 @@ def parse_args() -> FineTuneConfig:
     parser.add_argument("--epochs", type=int, default=FineTuneConfig.num_epochs)
     parser.add_argument("--batch-size", type=int, default=FineTuneConfig.batch_size)
     parser.add_argument("--learning-rate", type=float, default=FineTuneConfig.learning_rate)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=FineTuneConfig.seed,
+        help="Random seed for reproducible experiments.",
+    )
     parser.add_argument(
         "--moving-average-window",
         type=int,
@@ -209,6 +217,7 @@ def parse_args() -> FineTuneConfig:
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        seed=args.seed,
         finetune_mode=args.finetune_mode,
         peft_last_n_layers=args.peft_last_n_layers,
         test_size=args.test_size,
@@ -231,6 +240,21 @@ def resolve_device(device_flag: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.backends.mps.is_available() and hasattr(torch, "mps"):
+        try:
+            torch.mps.manual_seed(seed)
+        except Exception:
+            pass
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
 
 def configure_timesfm_device(model, device: torch.device) -> None:
@@ -1056,6 +1080,8 @@ def plot_covariate_results(
 
 def main() -> None:
     config = parse_args()
+    set_global_seed(config.seed)
+    print(f"Seed set to {config.seed}")
     series = fetch_ticker_history(config)
     if not (0.0 < config.val_fraction < 1.0):
         raise ValueError(f"val_fraction must be in (0, 1), got {config.val_fraction}.")
