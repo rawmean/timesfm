@@ -15,7 +15,7 @@ import torch.optim as optim
 import yfinance as yf
 from torch.utils.data import DataLoader, Dataset
 
-from equity_benchmark_compare import build_symbol_map, fetch_daily_close, normalize_from_start
+from equity_benchmark_compare import normalize_from_start
 from timesfm.torch.util import revin, update_running_stats
 
 try:
@@ -27,6 +27,16 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:  # pragma: no cover - fallback when tensorboard is unavailable
     SummaryWriter = None
+
+
+BENCHMARK_TICKERS = {
+    "Dow Jones": "^DJI",
+    "NASDAQ": "^IXIC",
+    "S&P 500": "^GSPC",
+    "Russell 2000": "^RUT",
+}
+VIX_COVARIATE_NAME = "VIX"
+VIX_SYMBOL = "^VIX"
 
 
 @dataclass(frozen=True)
@@ -42,7 +52,7 @@ class FineTuneConfig:
     batch_size: int = 8
     num_epochs: int = 15
     learning_rate: float = 1e-4
-    finetune_mode: str = "full"
+    finetune_mode: str = "peft"
     peft_last_n_layers: int = 2
     device: str = "auto"
     show_progress: bool = True
@@ -387,6 +397,41 @@ def fetch_ticker_history(config: FineTuneConfig) -> pd.Series:
     return series
 
 
+def fetch_adjusted_close_for_symbols(
+    symbols: dict[str, str], lookback_days: int
+) -> pd.DataFrame:
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=lookback_days)
+    ticker_list = list(symbols.values())
+
+    data = yf.download(
+        tickers=ticker_list,
+        start=start_date.isoformat(),
+        end=end_date.isoformat(),
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    if data.empty:
+        raise RuntimeError(
+            "No adjusted data returned from yfinance for covariates. Check ticker symbols or network."
+        )
+
+    if isinstance(data.columns, pd.MultiIndex):
+        close = data["Close"].copy()
+    else:
+        close = data[["Close"]].copy()
+        close.columns = [ticker_list[0]]
+
+    close = close.dropna(how="all")
+    close = close[ticker_list]
+    name_by_symbol = {symbol: name for name, symbol in symbols.items()}
+    close = close.rename(columns=name_by_symbol)
+    return close
+
+
 def load_model(config: FineTuneConfig):
     print("Loading TimesFM model...")
     torch.set_float32_matmul_precision("high")
@@ -651,8 +696,10 @@ def forecast_with_benchmark_covariates(
         config.years_of_history * 365, config.test_size + required + config.context_length
     )
 
-    symbols = build_symbol_map(config.ticker)
-    close_prices = fetch_daily_close(symbols, lookback_days=lookback_days)
+    symbols = {config.ticker: config.ticker}
+    symbols.update(BENCHMARK_TICKERS)
+    symbols[VIX_COVARIATE_NAME] = VIX_SYMBOL
+    close_prices = fetch_adjusted_close_for_symbols(symbols, lookback_days=lookback_days)
     normalized = normalize_from_start(close_prices).dropna()
     if config.ticker not in normalized.columns:
         raise ValueError(
@@ -673,7 +720,16 @@ def forecast_with_benchmark_covariates(
         raise ValueError(
             f"Need at least {required} MA points for covariate forecast, got {len(target_ma)}."
         )
+    covariate_columns = list(BENCHMARK_TICKERS.keys()) + [VIX_COVARIATE_NAME]
+    missing_covars = [c for c in covariate_columns if c not in normalized.columns]
+    if missing_covars:
+        raise ValueError(
+            f"Missing covariate columns in normalized frame: {missing_covars}. "
+            f"Available: {normalized.columns.tolist()}"
+        )
+
     frame = normalized.loc[target_ma.index].iloc[-required:].copy()
+    frame = frame[[config.ticker] + covariate_columns].ffill().bfill()
     target_ma = target_ma.loc[frame.index]
 
     base = float(target_ma.iloc[0])
@@ -688,6 +744,10 @@ def forecast_with_benchmark_covariates(
 
     day_of_week = frame.index.dayofweek.to_numpy(dtype=int)
     month_of_year = frame.index.month.to_numpy(dtype=int)
+    dynamic_numerical_covariates: dict[str, list[list[float]]] = {
+        cov_name: [frame[cov_name].to_numpy(dtype=float).tolist()]
+        for cov_name in covariate_columns
+    }
     dynamic_categorical_covariates: dict[str, list[list[int]]] = {
         "DayOfWeek": [day_of_week.tolist()],
         "MonthOfYear": [month_of_year.tolist()],
@@ -695,7 +755,7 @@ def forecast_with_benchmark_covariates(
 
     point_forecast_with_covars, _ = model.forecast_with_covariates(
         inputs=[input_target],
-        dynamic_numerical_covariates=None,
+        dynamic_numerical_covariates=dynamic_numerical_covariates,
         dynamic_categorical_covariates=dynamic_categorical_covariates,
         xreg_mode="timesfm + xreg",
         ridge=0.0,
