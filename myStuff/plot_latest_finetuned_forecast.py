@@ -13,7 +13,7 @@ import torch
 import yfinance as yf
 
 
-VALUE_METRIC_POSITIVE_RETURN = 0.05
+VALUE_METRIC_POSITIVE_RETURN = 0.03
 VALUE_METRIC_SIGMOID_TARGET = 0.8
 
 
@@ -242,7 +242,7 @@ def compute_value_metric(current_value: float, last_predicted_value: float) -> t
         raise ValueError("Current value is zero; cannot compute return-based value metric.")
 
     implied_return = (last_predicted_value - current_value) / current_value
-    # Calibrate sigmoid so that +5% -> 0.8 and -5% -> 0.2.
+    # Calibrate sigmoid so that +3% -> 0.8 and -3% -> 0.2.
     sigmoid_scale = np.log(VALUE_METRIC_SIGMOID_TARGET / (1.0 - VALUE_METRIC_SIGMOID_TARGET))
     sigmoid_scale = float(sigmoid_scale / VALUE_METRIC_POSITIVE_RETURN)
     sigmoid_value = 1.0 / (1.0 + np.exp(-sigmoid_scale * implied_return))
