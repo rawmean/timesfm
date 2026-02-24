@@ -41,17 +41,18 @@ VIX_SYMBOL = "^VIX"
 @dataclass(frozen=True)
 class FineTuneConfig:
     ticker: str = "VTI"
-    years_of_history: int = 5
+    years_of_history: int = 10
     price_column: str = "Close"
     moving_average_window: int = 7
-    use_calendar_covariates: bool = False
+    use_calendar_covariates: bool = True
+    numerical_covariates_mode: str = "off"
     covariate_boundary_correction: bool = True
     context_length: int = 32
     horizon: int = 7
     test_size: int = 120
     val_fraction: float = 0.15
     batch_size: int = 32
-    num_epochs: int = 15
+    num_epochs: int = 25
     learning_rate: float = 1e-4
     finetune_mode: str = "peft"
     peft_last_n_layers: int = 2
@@ -88,6 +89,22 @@ def _to_1d_float_array(values: np.ndarray | pd.Series | pd.DataFrame) -> np.ndar
     return arr.reshape(-1)
 
 
+def _inject_ticker_and_date(save_path: Path, ticker: str) -> Path:
+    date_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+    ticker_tag = ticker.upper()
+
+    if save_path.suffix == "":
+        return save_path / f"finetuned_timesfm_{ticker_tag}_{date_tag}.pt"
+
+    suffix = "".join(save_path.suffixes)
+    stem = save_path.name[: -len(suffix)] if suffix else save_path.name
+    if ticker_tag not in stem:
+        stem = f"{stem}_{ticker_tag}"
+    if date_tag not in stem:
+        stem = f"{stem}_{date_tag}"
+    return save_path.with_name(f"{stem}{suffix}")
+
+
 def parse_args() -> FineTuneConfig:
     parser = argparse.ArgumentParser(
         description="Fine-tune TimesFM on yfinance ticker data (5-year window)."
@@ -106,6 +123,17 @@ def parse_args() -> FineTuneConfig:
         "--use-calendar-covariates",
         action="store_true",
         help="Include DayOfWeek and MonthOfYear as dynamic categorical covariates.",
+    )
+    parser.add_argument(
+        "--numerical-covariates-mode",
+        type=str,
+        choices=["off", "last", "oracle"],
+        default=FineTuneConfig.numerical_covariates_mode,
+        help=(
+            "How to handle benchmark/VIX future values in the horizon: "
+            "'off' disables numerical covariates, 'last' carries the last observed value forward, "
+            "'oracle' uses realized future values (backtest only; non-causal)."
+        ),
     )
     parser.add_argument(
         "--no-covariate-boundary-correction",
@@ -160,13 +188,23 @@ def parse_args() -> FineTuneConfig:
         default=FineTuneConfig.log_dir,
         help="TensorBoard log directory.",
     )
-    parser.add_argument("--save-path", type=Path, default=FineTuneConfig.save_path)
+    parser.add_argument(
+        "--save-path",
+        type=Path,
+        default=FineTuneConfig.save_path,
+        help=(
+            "Checkpoint path. Ticker and UTC date are always appended to filename. "
+            "If a directory is provided, a dated filename is created inside it."
+        ),
+    )
     args = parser.parse_args()
+    save_path = _inject_ticker_and_date(args.save_path, args.ticker)
 
     return FineTuneConfig(
         ticker=args.ticker.upper(),
         moving_average_window=args.moving_average_window,
         use_calendar_covariates=args.use_calendar_covariates,
+        numerical_covariates_mode=args.numerical_covariates_mode,
         covariate_boundary_correction=not args.no_covariate_boundary_correction,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
@@ -179,7 +217,7 @@ def parse_args() -> FineTuneConfig:
         show_progress=not args.no_progress,
         tensorboard=not args.no_tensorboard,
         log_dir=args.log_dir,
-        save_path=args.save_path,
+        save_path=save_path,
     )
 
 
@@ -232,6 +270,7 @@ def maybe_create_writer(config: FineTuneConfig):
             f"test_size={config.test_size}, val_fraction={config.val_fraction}, "
             f"moving_average_window={config.moving_average_window}, "
             f"use_calendar_covariates={config.use_calendar_covariates}, "
+            f"numerical_covariates_mode={config.numerical_covariates_mode}, "
             f"covariate_boundary_correction={config.covariate_boundary_correction}, "
             f"finetune_mode={config.finetune_mode}, peft_last_n_layers={config.peft_last_n_layers}, "
             f"epochs={config.num_epochs}, batch_size={config.batch_size}, "
@@ -670,6 +709,23 @@ def load_checkpoint_if_available(model, checkpoint_path: Path) -> bool:
         return False
 
 
+def find_latest_ticker_checkpoint(config: FineTuneConfig) -> Path | None:
+    if config.save_path.exists():
+        return config.save_path
+
+    parent = config.save_path.parent
+    if not parent.exists():
+        return None
+
+    ticker_tag = config.ticker.upper()
+    candidates = sorted(
+        parent.glob(f"*{ticker_tag}*.pt"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
 def prompt_yes_no(question: str, default_no: bool = True) -> bool:
     suffix = " [y/N]: " if default_no else " [Y/n]: "
     try:
@@ -737,9 +793,24 @@ def forecast_last_window(
 
 def forecast_with_benchmark_covariates(
     model,
+    context_series: pd.Series,
+    future_series: pd.Series,
     config: FineTuneConfig,
 ) -> tuple[np.ndarray, np.ndarray, list[pd.Timestamp], np.ndarray]:
-    required = config.context_length + config.horizon
+    if len(context_series) < config.context_length:
+        raise ValueError(
+            f"Need at least {config.context_length} context points, got {len(context_series)}."
+        )
+    if len(future_series) < config.horizon:
+        raise ValueError(
+            f"Need at least {config.horizon} future/holdout points, got {len(future_series)}."
+        )
+
+    context_slice = context_series.iloc[-config.context_length :]
+    future_slice = future_series.iloc[: config.horizon]
+    frame_index = context_slice.index.append(future_slice.index)
+    required = len(frame_index)
+
     lookback_days = max(
         config.years_of_history * 365, config.test_size + required + config.context_length
     )
@@ -748,20 +819,6 @@ def forecast_with_benchmark_covariates(
     symbols.update(BENCHMARK_TICKERS)
     symbols[VIX_COVARIATE_NAME] = VIX_SYMBOL
     close_prices = fetch_adjusted_close_for_symbols(symbols, lookback_days=lookback_days)
-    target_ma = (
-        close_prices[config.ticker]
-        .astype(float)
-        .rolling(
-            window=config.moving_average_window,
-            min_periods=config.moving_average_window,
-        )
-        .mean()
-        .dropna()
-    )
-    if len(target_ma) < required:
-        raise ValueError(
-            f"Need at least {required} MA points for covariate forecast, got {len(target_ma)}."
-        )
     covariate_columns = list(BENCHMARK_TICKERS.keys()) + [VIX_COVARIATE_NAME]
     missing_covars = [c for c in covariate_columns if c not in close_prices.columns]
     if missing_covars:
@@ -770,25 +827,34 @@ def forecast_with_benchmark_covariates(
             f"Available: {close_prices.columns.tolist()}"
         )
 
-    aligned = close_prices[[config.ticker] + covariate_columns].dropna(how="any").copy()
-    target_ma = (
-        aligned[config.ticker]
-        .astype(float)
-        .rolling(
-            window=config.moving_average_window,
-            min_periods=config.moving_average_window,
-        )
-        .mean()
-        .dropna()
-    )
-    if len(target_ma) < required:
+    cov_lookup = close_prices[covariate_columns].astype(float).copy()
+    cov_context = cov_lookup.reindex(context_slice.index).ffill().bfill()
+    if cov_context.isna().any().any():
         raise ValueError(
-            f"Need at least {required} aligned MA points, got {len(target_ma)}."
+            "Covariate context contains NaNs after alignment. Check ticker data coverage."
         )
 
-    frame_index = target_ma.index[-required:]
-    target_ma = target_ma.loc[frame_index]
-    cov_raw = aligned.loc[frame_index, covariate_columns].astype(float).copy()
+    cov_raw = pd.DataFrame(index=frame_index, dtype=float)
+    cov_mode = config.numerical_covariates_mode
+    if cov_mode == "oracle":
+        cov_oracle = cov_lookup.reindex(frame_index).ffill().bfill()
+        if cov_oracle.isna().any().any():
+            raise ValueError(
+                "Oracle covariates contain NaNs after alignment. Check ticker data coverage."
+            )
+        cov_raw = cov_oracle.copy()
+    elif cov_mode == "last":
+        cov_raw.loc[context_slice.index, covariate_columns] = cov_context.to_numpy(dtype=float)
+        last_vals = cov_context.iloc[-1]
+        for cov_name in covariate_columns:
+            cov_raw.loc[future_slice.index, cov_name] = float(last_vals[cov_name])
+    elif cov_mode == "off":
+        cov_raw = pd.DataFrame(index=frame_index)
+    else:
+        raise ValueError(
+            f"Unsupported numerical_covariates_mode: {cov_mode}. Expected one of off/last/oracle."
+        )
+
     internal_model = _extract_torch_model(model)
     patch_len = int(getattr(internal_model, "p", 32))
     if config.context_length > patch_len:
@@ -802,36 +868,56 @@ def forecast_with_benchmark_covariates(
             f"using xreg_mode='{xreg_mode}' for covariates."
         )
     train_start = config.context_length - xreg_train_len
-    cov_frame = pd.DataFrame(index=cov_raw.index)
-    for cov_name in covariate_columns:
-        cov_arr = cov_raw[cov_name].to_numpy(dtype=float)
-        train_slice = cov_arr[train_start : config.context_length]
-        mu = float(np.mean(train_slice))
-        sigma = float(np.std(train_slice))
-        if sigma < 1e-8:
-            sigma = 1.0
-        cov_frame[cov_name] = (cov_arr - mu) / sigma
-    if cov_frame.isna().any().any():
-        raise ValueError("Covariate standardization produced NaNs; check zero/missing covariates.")
+    cov_frame = pd.DataFrame(index=frame_index)
+    if cov_mode != "off":
+        for cov_name in covariate_columns:
+            cov_arr = cov_raw[cov_name].to_numpy(dtype=float)
+            train_slice = cov_arr[train_start : config.context_length]
+            mu = float(np.mean(train_slice))
+            sigma = float(np.std(train_slice))
+            if sigma < 1e-8:
+                sigma = 1.0
+            cov_frame[cov_name] = (cov_arr - mu) / sigma
+        if cov_frame.isna().any().any():
+            raise ValueError(
+                "Covariate standardization produced NaNs; check zero/missing covariates."
+            )
 
-    target_series = target_ma.to_numpy(dtype=np.float32)
+    target_series = np.concatenate(
+        [
+            context_slice.to_numpy(dtype=np.float32),
+            future_slice.to_numpy(dtype=np.float32),
+        ]
+    )
     input_target = target_series[: config.context_length]
-    raw_target = target_ma.to_numpy(dtype=float)
+    raw_target = np.concatenate(
+        [
+            context_slice.to_numpy(dtype=float),
+            future_slice.to_numpy(dtype=float),
+        ]
+    )
     raw_context = raw_target[: config.context_length]
     raw_actual_future = raw_target[config.context_length :]
 
     day_of_week = frame_index.dayofweek.to_numpy(dtype=int)
     month_of_year = frame_index.month.to_numpy(dtype=int)
-    dynamic_numerical_covariates: dict[str, list[list[float]]] = {
-        cov_name: [cov_frame[cov_name].to_numpy(dtype=float).tolist()]
-        for cov_name in covariate_columns
-    }
+    dynamic_numerical_covariates: dict[str, list[list[float]]] | None = None
+    if cov_mode != "off":
+        dynamic_numerical_covariates = {
+            cov_name: [cov_frame[cov_name].to_numpy(dtype=float).tolist()]
+            for cov_name in covariate_columns
+        }
     dynamic_categorical_covariates: dict[str, list[list[int]]] | None = None
     if config.use_calendar_covariates:
         dynamic_categorical_covariates = {
             "DayOfWeek": [day_of_week.tolist()],
             "MonthOfYear": [month_of_year.tolist()],
         }
+    if dynamic_numerical_covariates is None and dynamic_categorical_covariates is None:
+        raise ValueError(
+            "No covariates enabled. Turn on --use-calendar-covariates and/or set "
+            "--numerical-covariates-mode to last/oracle."
+        )
 
     point_forecast_with_covars, _ = model.forecast_with_covariates(
         inputs=[input_target.astype(np.float32)],
@@ -1014,9 +1100,10 @@ def main() -> None:
     model, device = load_model(config)
     losses: list[float] = []
     val_losses: list[float] = []
-    if config.save_path.exists():
+    checkpoint_candidate = find_latest_ticker_checkpoint(config)
+    if checkpoint_candidate is not None:
         retrain = prompt_yes_no(
-            f"Found existing fine-tuned checkpoint at {config.save_path}. Fine-tune again?",
+            f"Found existing fine-tuned checkpoint at {checkpoint_candidate}. Fine-tune again?",
             default_no=True,
         )
         if retrain:
@@ -1028,7 +1115,7 @@ def main() -> None:
                 device,
             )
         else:
-            loaded = load_checkpoint_if_available(model, config.save_path)
+            loaded = load_checkpoint_if_available(model, checkpoint_candidate)
             if not loaded:
                 print("Checkpoint load failed; proceeding with fresh fine-tuning.")
                 model, losses, val_losses = finetune_model(
@@ -1095,20 +1182,33 @@ def main() -> None:
         plt.tight_layout()
         plt.show()
 
-    print("\nGenerating forecast with benchmark covariates...")
-    try:
-        cov_pred, cov_actual, cov_dates, cov_context = forecast_with_benchmark_covariates(
-            model, config
+    if not config.use_calendar_covariates and config.numerical_covariates_mode == "off":
+        print(
+            "\nSkipping covariate forecast: no covariates are enabled "
+            "(enable --use-calendar-covariates and/or --numerical-covariates-mode last|oracle)."
         )
-        print("\nCovariate Forecast summary (benchmark-style setup)")
-        print("=" * 70)
-        for i in range(config.horizon):
-            date_str = cov_dates[i].strftime("%Y-%m-%d")
-            actual = cov_actual[i] if i < len(cov_actual) else float("nan")
-            print(f"{date_str}: pred_covars={cov_pred[i]:.2f}, actual={float(actual):.2f}")
-        plot_covariate_results(cov_context, cov_pred, cov_actual, cov_dates, config)
-    except Exception as exc:
-        print(f"Covariate forecast failed: {exc}")
+    else:
+        print("\nGenerating forecast with benchmark covariates...")
+        try:
+            cov_pred, cov_actual, cov_dates, cov_context = forecast_with_benchmark_covariates(
+                model,
+                context_series=eval_context,
+                future_series=holdout_series,
+                config=config,
+            )
+            print(
+                "\nCovariate Forecast summary "
+                f"(numerical_mode={config.numerical_covariates_mode}, "
+                f"calendar={config.use_calendar_covariates})"
+            )
+            print("=" * 70)
+            for i in range(config.horizon):
+                date_str = cov_dates[i].strftime("%Y-%m-%d")
+                actual = cov_actual[i] if i < len(cov_actual) else float("nan")
+                print(f"{date_str}: pred_covars={cov_pred[i]:.2f}, actual={float(actual):.2f}")
+            plot_covariate_results(cov_context, cov_pred, cov_actual, cov_dates, config)
+        except Exception as exc:
+            print(f"Covariate forecast failed: {exc}")
 
     plot_results(
         series=series,
