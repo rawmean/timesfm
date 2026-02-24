@@ -789,10 +789,18 @@ def forecast_with_benchmark_covariates(
     frame_index = target_ma.index[-required:]
     target_ma = target_ma.loc[frame_index]
     cov_raw = aligned.loc[frame_index, covariate_columns].astype(float).copy()
-    xreg_mode = "timesfm + xreg"
     internal_model = _extract_torch_model(model)
     patch_len = int(getattr(internal_model, "p", 32))
-    xreg_train_len = max(1, config.context_length - patch_len)
+    if config.context_length > patch_len:
+        xreg_mode = "timesfm + xreg"
+        xreg_train_len = config.context_length - patch_len
+    else:
+        xreg_mode = "xreg + timesfm"
+        xreg_train_len = config.context_length
+        print(
+            f"Info: context_length={config.context_length} <= patch_len={patch_len}; "
+            f"using xreg_mode='{xreg_mode}' for covariates."
+        )
     train_start = config.context_length - xreg_train_len
     cov_frame = pd.DataFrame(index=cov_raw.index)
     for cov_name in covariate_columns:
