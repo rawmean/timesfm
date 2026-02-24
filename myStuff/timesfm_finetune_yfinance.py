@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -15,7 +15,6 @@ import torch.optim as optim
 import yfinance as yf
 from torch.utils.data import DataLoader, Dataset
 
-from equity_benchmark_compare import normalize_from_start
 from timesfm.torch.util import revin, update_running_stats
 
 try:
@@ -45,11 +44,13 @@ class FineTuneConfig:
     years_of_history: int = 5
     price_column: str = "Close"
     moving_average_window: int = 5
+    use_calendar_covariates: bool = False
+    covariate_boundary_correction: bool = True
     context_length: int = 64
     horizon: int = 7
     test_size: int = 120
     val_fraction: float = 0.15
-    batch_size: int = 8
+    batch_size: int = 32
     num_epochs: int = 15
     learning_rate: float = 1e-4
     finetune_mode: str = "peft"
@@ -100,6 +101,16 @@ def parse_args() -> FineTuneConfig:
         type=int,
         default=FineTuneConfig.moving_average_window,
         help="Window size for moving-average target (set 5 for MA5).",
+    )
+    parser.add_argument(
+        "--use-calendar-covariates",
+        action="store_true",
+        help="Include DayOfWeek and MonthOfYear as dynamic categorical covariates.",
+    )
+    parser.add_argument(
+        "--no-covariate-boundary-correction",
+        action="store_true",
+        help="Disable boundary offset correction against no-covariate baseline.",
     )
     parser.add_argument(
         "--finetune-mode",
@@ -155,6 +166,8 @@ def parse_args() -> FineTuneConfig:
     return FineTuneConfig(
         ticker=args.ticker.upper(),
         moving_average_window=args.moving_average_window,
+        use_calendar_covariates=args.use_calendar_covariates,
+        covariate_boundary_correction=not args.no_covariate_boundary_correction,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -218,6 +231,8 @@ def maybe_create_writer(config: FineTuneConfig):
             f"context={config.context_length}, horizon={config.horizon}, "
             f"test_size={config.test_size}, val_fraction={config.val_fraction}, "
             f"moving_average_window={config.moving_average_window}, "
+            f"use_calendar_covariates={config.use_calendar_covariates}, "
+            f"covariate_boundary_correction={config.covariate_boundary_correction}, "
             f"finetune_mode={config.finetune_mode}, peft_last_n_layers={config.peft_last_n_layers}, "
             f"epochs={config.num_epochs}, batch_size={config.batch_size}, "
             f"learning_rate={config.learning_rate}, device={config.device}"
@@ -337,7 +352,7 @@ def differentiable_point_forecast(
 
 
 def fetch_ticker_history(config: FineTuneConfig) -> pd.Series:
-    end = datetime.utcnow().date()
+    end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=365 * config.years_of_history)
 
     print(f"Downloading {config.ticker} from {start} to {end}...")
@@ -400,7 +415,7 @@ def fetch_ticker_history(config: FineTuneConfig) -> pd.Series:
 def fetch_adjusted_close_for_symbols(
     symbols: dict[str, str], lookback_days: int
 ) -> pd.DataFrame:
-    end_date = datetime.utcnow().date()
+    end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=lookback_days)
     ticker_list = list(symbols.values())
 
@@ -700,12 +715,6 @@ def forecast_with_benchmark_covariates(
     symbols.update(BENCHMARK_TICKERS)
     symbols[VIX_COVARIATE_NAME] = VIX_SYMBOL
     close_prices = fetch_adjusted_close_for_symbols(symbols, lookback_days=lookback_days)
-    normalized = normalize_from_start(close_prices).dropna()
-    if config.ticker not in normalized.columns:
-        raise ValueError(
-            f"Ticker '{config.ticker}' not found in normalized benchmark frame columns: "
-            f"{normalized.columns.tolist()}"
-        )
     target_ma = (
         close_prices[config.ticker]
         .astype(float)
@@ -721,50 +730,87 @@ def forecast_with_benchmark_covariates(
             f"Need at least {required} MA points for covariate forecast, got {len(target_ma)}."
         )
     covariate_columns = list(BENCHMARK_TICKERS.keys()) + [VIX_COVARIATE_NAME]
-    missing_covars = [c for c in covariate_columns if c not in normalized.columns]
+    missing_covars = [c for c in covariate_columns if c not in close_prices.columns]
     if missing_covars:
         raise ValueError(
-            f"Missing covariate columns in normalized frame: {missing_covars}. "
-            f"Available: {normalized.columns.tolist()}"
+            f"Missing covariate columns in adjusted close frame: {missing_covars}. "
+            f"Available: {close_prices.columns.tolist()}"
         )
 
-    frame = normalized.loc[target_ma.index].iloc[-required:].copy()
-    frame = frame[[config.ticker] + covariate_columns].ffill().bfill()
-    target_ma = target_ma.loc[frame.index]
+    aligned = close_prices[[config.ticker] + covariate_columns].dropna(how="any").copy()
+    target_ma = (
+        aligned[config.ticker]
+        .astype(float)
+        .rolling(
+            window=config.moving_average_window,
+            min_periods=config.moving_average_window,
+        )
+        .mean()
+        .dropna()
+    )
+    if len(target_ma) < required:
+        raise ValueError(
+            f"Need at least {required} aligned MA points, got {len(target_ma)}."
+        )
 
-    base = float(target_ma.iloc[0])
-    if base == 0.0:
-        raise ValueError("MA target base value is zero, cannot normalize for covariate forecast.")
-    target_series = (target_ma / base).to_numpy(dtype=np.float32)
+    frame_index = target_ma.index[-required:]
+    target_ma = target_ma.loc[frame_index]
+    cov_raw = aligned.loc[frame_index, covariate_columns].astype(float).copy()
+    xreg_mode = "timesfm + xreg"
+    internal_model = _extract_torch_model(model)
+    patch_len = int(getattr(internal_model, "p", 32))
+    xreg_train_len = max(1, config.context_length - patch_len)
+    train_start = config.context_length - xreg_train_len
+    cov_frame = pd.DataFrame(index=cov_raw.index)
+    for cov_name in covariate_columns:
+        cov_arr = cov_raw[cov_name].to_numpy(dtype=float)
+        train_slice = cov_arr[train_start : config.context_length]
+        mu = float(np.mean(train_slice))
+        sigma = float(np.std(train_slice))
+        if sigma < 1e-8:
+            sigma = 1.0
+        cov_frame[cov_name] = (cov_arr - mu) / sigma
+    if cov_frame.isna().any().any():
+        raise ValueError("Covariate standardization produced NaNs; check zero/missing covariates.")
+
+    target_series = target_ma.to_numpy(dtype=np.float32)
     input_target = target_series[: config.context_length]
     raw_target = target_ma.to_numpy(dtype=float)
     raw_context = raw_target[: config.context_length]
     raw_actual_future = raw_target[config.context_length :]
-    raw_base = float(raw_context[0])
 
-    day_of_week = frame.index.dayofweek.to_numpy(dtype=int)
-    month_of_year = frame.index.month.to_numpy(dtype=int)
+    day_of_week = frame_index.dayofweek.to_numpy(dtype=int)
+    month_of_year = frame_index.month.to_numpy(dtype=int)
     dynamic_numerical_covariates: dict[str, list[list[float]]] = {
-        cov_name: [frame[cov_name].to_numpy(dtype=float).tolist()]
+        cov_name: [cov_frame[cov_name].to_numpy(dtype=float).tolist()]
         for cov_name in covariate_columns
     }
-    dynamic_categorical_covariates: dict[str, list[list[int]]] = {
-        "DayOfWeek": [day_of_week.tolist()],
-        "MonthOfYear": [month_of_year.tolist()],
-    }
+    dynamic_categorical_covariates: dict[str, list[list[int]]] | None = None
+    if config.use_calendar_covariates:
+        dynamic_categorical_covariates = {
+            "DayOfWeek": [day_of_week.tolist()],
+            "MonthOfYear": [month_of_year.tolist()],
+        }
 
     point_forecast_with_covars, _ = model.forecast_with_covariates(
-        inputs=[input_target],
+        inputs=[input_target.astype(np.float32)],
         dynamic_numerical_covariates=dynamic_numerical_covariates,
         dynamic_categorical_covariates=dynamic_categorical_covariates,
-        xreg_mode="timesfm + xreg",
-        ridge=0.0,
+        xreg_mode=xreg_mode,
+        ridge=0.1,
         normalize_xreg_target_per_input=True,
     )
 
-    pred_norm = np.asarray(point_forecast_with_covars[0], dtype=float)[-config.horizon :]
-    pred_raw = pred_norm * raw_base
-    forecast_dates = frame.index[-config.horizon :].to_list()
+    pred_raw = np.asarray(point_forecast_with_covars[0], dtype=float)[-config.horizon :]
+    point_forecast_no_covars, _ = model.forecast(
+        horizon=config.horizon,
+        inputs=[input_target.astype(np.float32)],
+    )
+    pred_no_covars = np.asarray(point_forecast_no_covars[0], dtype=float)[-config.horizon :]
+    if config.covariate_boundary_correction:
+        boundary_offset = pred_raw[0] - pred_no_covars[0]
+        pred_raw = pred_raw - boundary_offset
+    forecast_dates = frame_index[-config.horizon :].to_list()
     return pred_raw, raw_actual_future, forecast_dates, raw_context
 
 
