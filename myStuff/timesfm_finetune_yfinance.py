@@ -41,7 +41,7 @@ VIX_SYMBOL = "^VIX"
 @dataclass(frozen=True)
 class FineTuneConfig:
     ticker: str = "VTI"
-    years_of_history: int = 10
+    years_of_history: int = 5
     price_column: str = "Close"
     moving_average_window: int = 7
     use_calendar_covariates: bool = True
@@ -52,7 +52,7 @@ class FineTuneConfig:
     test_size: int = 120
     val_fraction: float = 0.15
     batch_size: int = 32
-    num_epochs: int = 25
+    num_epochs: int = 15
     learning_rate: float = 1e-4
     finetune_mode: str = "peft"
     peft_last_n_layers: int = 2
