@@ -41,7 +41,7 @@ VIX_SYMBOL = "^VIX"
 
 @dataclass(frozen=True)
 class FineTuneConfig:
-    ticker: str = "VTI"
+    ticker: str = "QQQ"
     years_of_history: int = 5
     price_column: str = "Close"
     moving_average_window: int = 7
