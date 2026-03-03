@@ -27,6 +27,8 @@ class PlotConfig:
     moving_average_window: int = 5
     context_length: int | None = None
     horizon: int | None = None
+    past_pred_days: int = 30
+    future_days: int = 7
     model_id: str = "google/timesfm-2.5-200m-pytorch"
     device: str = "auto"
 
@@ -48,6 +50,18 @@ def parse_args() -> PlotConfig:
     parser.add_argument("--context", type=int, default=None, help="Override context length from checkpoint.")
     parser.add_argument("--horizon", type=int, default=None, help="Override horizon from checkpoint.")
     parser.add_argument(
+        "--past-pred-days",
+        type=int,
+        default=PlotConfig.past_pred_days,
+        help="Number of past business days to plot with rolling 1-step predictions.",
+    )
+    parser.add_argument(
+        "--future-days",
+        type=int,
+        default=PlotConfig.future_days,
+        help="Number of future business days to forecast and plot.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         choices=["auto", "mps", "cpu"],
@@ -64,6 +78,8 @@ def parse_args() -> PlotConfig:
         moving_average_window=args.moving_average_window,
         context_length=args.context,
         horizon=args.horizon,
+        past_pred_days=args.past_pred_days,
+        future_days=args.future_days,
         device=args.device,
     )
 
@@ -237,6 +253,37 @@ def forecast_latest_window(
     return pred, quantiles, future_dates, context_series
 
 
+def forecast_past_days_one_step(
+    model,
+    series: pd.Series,
+    context_len: int,
+    past_days: int,
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    if past_days < 1:
+        raise ValueError("past_pred_days must be >= 1")
+    if len(series) < context_len + past_days:
+        raise ValueError(
+            f"Need at least context_len + past_pred_days points ({context_len + past_days}), got {len(series)}."
+        )
+
+    target_indices = range(len(series) - past_days, len(series))
+    pred_values: list[float] = []
+    actual_values: list[float] = []
+    target_dates: list[pd.Timestamp] = []
+
+    for target_idx in target_indices:
+        context_values = series.iloc[target_idx - context_len:target_idx].to_numpy(dtype=np.float32)
+        point_forecast, _ = model.forecast(
+            horizon=1,
+            inputs=[context_values],
+        )
+        pred_values.append(float(np.asarray(point_forecast[0], dtype=float)[0]))
+        actual_values.append(float(series.iloc[target_idx]))
+        target_dates.append(pd.Timestamp(series.index[target_idx]))
+
+    return pd.DatetimeIndex(target_dates), np.asarray(pred_values), np.asarray(actual_values)
+
+
 def compute_value_metric(current_value: float, last_predicted_value: float) -> tuple[float, float]:
     if current_value == 0.0:
         raise ValueError("Current value is zero; cannot compute return-based value metric.")
@@ -254,6 +301,9 @@ def plot_context_and_forecast(
     ticker: str,
     ma_window: int,
     context_series: pd.Series,
+    past_dates: pd.DatetimeIndex,
+    past_pred: np.ndarray,
+    past_actual: np.ndarray,
     pred: np.ndarray,
     quantiles: np.ndarray,
     future_dates: pd.DatetimeIndex,
@@ -269,6 +319,21 @@ def plot_context_and_forecast(
         linewidth=2,
         marker="o",
         markersize=3,
+    )
+    plt.plot(
+        past_dates,
+        past_actual,
+        label=f"Actual (last {len(past_actual)}d)",
+        color="tab:blue",
+        linewidth=1.8,
+    )
+    plt.plot(
+        past_dates,
+        past_pred,
+        label=f"Predicted (last {len(past_pred)}d, 1-step)",
+        color="tab:orange",
+        linewidth=1.8,
+        linestyle="--",
     )
     plt.plot(
         future_dates,
@@ -287,7 +352,9 @@ def plot_context_and_forecast(
         label="p10-p90",
     )
     plt.axvline(context_series.index[-1], color="gray", linestyle=":", linewidth=1)
-    plt.title(f"{ticker} MA{ma_window}: Last {len(context_series)} Context Days + {len(pred)}-Day Forecast")
+    plt.title(
+        f"{ticker} MA{ma_window}: Last {len(past_pred)}d rolling predictions + next {len(pred)}d forecast"
+    )
     plt.xlabel("Date")
     plt.ylabel("Moving Average")
     plt.text(
@@ -331,11 +398,26 @@ def main() -> None:
         device=device,
     )
 
+    if config.future_days < 1:
+        raise ValueError("future_days must be >= 1")
+    if config.future_days > horizon:
+        print(
+            f"Warning: requested future_days={config.future_days} exceeds checkpoint horizon={horizon}; "
+            f"using future_days={horizon}."
+        )
+    forecast_days = min(config.future_days, horizon)
+
     pred, quantiles, future_dates, context_series = forecast_latest_window(
         model=model,
         series=series,
         context_len=context_len,
-        horizon=horizon,
+        horizon=forecast_days,
+    )
+    past_dates, past_pred, past_actual = forecast_past_days_one_step(
+        model=model,
+        series=series,
+        context_len=context_len,
+        past_days=config.past_pred_days,
     )
     current_value = float(context_series.iloc[-1])
     last_predicted_value = float(pred[-1])
@@ -345,11 +427,13 @@ def main() -> None:
     )
 
     print("\nForecast values:")
-    for i in range(horizon):
+    for i in range(forecast_days):
         print(
             f"{future_dates[i].strftime('%Y-%m-%d')}: "
             f"pred={pred[i]:.2f}, p10={quantiles[i, 1]:.2f}, p90={quantiles[i, 9]:.2f}"
         )
+    mae = float(np.mean(np.abs(past_pred - past_actual)))
+    print(f"\nPast {config.past_pred_days}-day rolling 1-step MAE: {mae:.4f}")
     print(
         f"\nValue metric: {value_metric:.2f}/100 "
         f"(current={current_value:.2f}, last_pred={last_predicted_value:.2f}, "
@@ -360,6 +444,9 @@ def main() -> None:
         ticker=ticker,
         ma_window=config.moving_average_window,
         context_series=context_series,
+        past_dates=past_dates,
+        past_pred=past_pred,
+        past_actual=past_actual,
         pred=pred,
         quantiles=quantiles,
         future_dates=future_dates,
